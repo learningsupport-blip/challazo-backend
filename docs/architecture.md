@@ -504,7 +504,7 @@ Cloud Build (cloudbuild.yaml)
 | Local | `uvicorn app.main:app --reload` on **8000**; `.env` |
 | Container / Cloud Run | Dockerfile uvicorn **0.0.0.0:8080**; secrets from Secret Manager |
 
-Production substitutions and multi-project (staging vs prod) triggers: [README — Production](../README.md#production-cross-origin-frontend) and [Multi-environment deploy](../README.md#multi-environment-deploy-staging--production).
+Production substitutions, secrets, and local configuration: [README — Deployment](../README.md#deployment) and [Configuration](../README.md#configuration).
 
 ---
 

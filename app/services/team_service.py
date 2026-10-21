@@ -1,0 +1,779 @@
+"""
+Per-round team enrollment (single, sized team, or unrestricted).
+
+Collections:
+- ``hackathon_teams`` — team roster for a hackathon round
+- ``hackathon_enrollments`` — one doc per (hackathon, round, student)
+- ``team_join_codes`` — active 6-digit join codes (hashed, 5-minute TTL)
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta
+from typing import Any, Callable
+
+from app.exceptions import BadRequestError, ConflictError, ForbiddenError, NotFoundError
+from app.models.team_model import (
+    CreateTeamResponse,
+    HackathonParticipationResponse,
+    HackathonTeamResponse,
+    JoinTeamResponse,
+    TeamJoinCodeResponse,
+    TeamMemberSummary,
+)
+from app.models.user_model import CurrentUser
+from app.services.firebase import FirebaseService
+from app.services.hackathon_service import HackathonService
+from app.services.submission.uniqueness import (
+    SUBMISSION_LIMIT_MESSAGE,
+    TEAM_SUBMISSION_LIMIT_MESSAGE,
+    assert_within_submission_limit,
+    list_round_submissions,
+)
+from app.services.user_service import UserService
+from app.utils.hackathon_schedule import closed_on_message, opens_on_message, window_status
+from app.utils.hackathon_visibility import student_can_see
+from app.utils.ids import new_uuid
+from app.utils.hackathon_round import (
+    TeamBounds,
+    get_timeline_round,
+    hackathon_max_submissions,
+    resolve_team_bounds,
+    round_auto_ai_evaluation,
+    round_github_ai_evaluation,
+    round_is_published,
+    round_open_for_submission,
+    round_student_status,
+    team_incomplete_message,
+    team_too_large_message,
+    round_working_demo_video_required,
+)
+from app.utils.team_code import (
+    generate_team_join_code,
+    hash_team_join_code,
+    join_code_document_id,
+)
+from app.utils.time import now_ist, now_ist_iso, parse_to_ist
+
+
+logger = logging.getLogger(__name__)
+
+TEAMS = "hackathon_teams"
+ENROLLMENTS = "hackathon_enrollments"
+JOIN_CODES = "team_join_codes"
+JOIN_CODE_TTL = timedelta(minutes=5)
+
+
+class TeamService:
+    def __init__(
+        self,
+        firebase: FirebaseService | None = None,
+        hackathon_service: HackathonService | None = None,
+        user_service: UserService | None = None,
+        now_fn: Callable[[], datetime] | None = None,
+    ):
+        self.firebase = firebase or FirebaseService()
+        self.hackathon_service = hackathon_service or HackathonService(firebase=self.firebase)
+        self.user_service = user_service or UserService(firebase=self.firebase)
+        self._now = now_fn or now_ist
+
+    def get_participation(
+        self, hackathon_id: str, round_index: int, user: CurrentUser
+    ) -> HackathonParticipationResponse:
+        hackathon = self._require_hackathon(hackathon_id)
+        self._assert_visible_to_student(hackathon, user)
+        round_, round_title, bounds = self._resolve_round(hackathon, round_index)
+        self._assert_round_visible_to_student(hackathon, round_index, round_)
+
+        enrollment = self._get_enrollment_doc(hackathon_id, round_index, user.user_id)
+        team = None
+        role = None
+        enrolled = enrollment is not None
+        round_status = round_student_status(round_, now=self._now())
+        round_open = round_open_for_submission(hackathon, round_index, now=self._now())
+        can_submit = False
+        can_continue_to_demo = False
+        block_reason = None
+        pending = None
+
+        if enrolled:
+            role = enrollment.get("role")
+            if enrollment.get("team_id"):
+                team_doc = self.firebase.get_document(TEAMS, enrollment["team_id"])
+                if team_doc:
+                    team = self._team_response(
+                        enrollment["team_id"],
+                        team_doc,
+                        round_index=round_index,
+                        round_title=round_title,
+                    )
+            if role == "member":
+                pending = None
+            elif (
+                role == "leader"
+                and bounds.mode == "multi"
+                and team
+                and (
+                    team.member_count < bounds.min_size
+                    or (bounds.max_size is not None and team.member_count > bounds.max_size)
+                )
+            ):
+                pending = "complete_team"
+                if bounds.max_size is not None and team.member_count > bounds.max_size:
+                    block_reason = team_too_large_message(bounds.max_size)
+                else:
+                    block_reason = team_incomplete_message(bounds.min_size, bounds.max_size)
+            elif not round_open:
+                pending = "round_not_open"
+                if round_status == "scheduled":
+                    block_reason = opens_on_message(
+                        round_.get("start_date"),
+                        round_.get("start_time"),
+                        what="This round",
+                    )
+                elif round_status == "closed":
+                    block_reason = closed_on_message(
+                        round_.get("end_date"),
+                        round_.get("end_time"),
+                        what="This round",
+                    )
+            elif role == "solo":
+                can_submit = True
+                can_continue_to_demo = True
+                pending = "ready"
+            elif role == "leader":
+                can_submit = True
+                can_continue_to_demo = True
+                pending = "ready"
+        elif bounds.mode == "single":
+            pending = "solo_enroll"
+        else:
+            pending = "choose_role"
+
+        submissions = list_round_submissions(
+            self.firebase,
+            student_id=user.user_id,
+            hackathon_id=hackathon_id,
+            round_index=round_index,
+            team_id=(team.id if team else None),
+        )
+        submission_limit = hackathon_max_submissions(hackathon)
+        submission_count = len(submissions)
+        submissions_remaining = max(0, submission_limit - submission_count)
+        already_submitted = submission_count > 0
+        existing_submission_id = submissions[-1]["id"] if submissions else None
+        hackathon_status = window_status(
+            hackathon.get("start_date"),
+            hackathon.get("end_date"),
+            hackathon.get("start_time"),
+            hackathon.get("end_time"),
+            now=self._now(),
+        )
+        if hackathon_status != "open" and pending != "already_submitted":
+            can_submit = False
+            can_continue_to_demo = False
+            if hackathon_status == "scheduled" and pending == "ready":
+                pending = "hackathon_not_open"
+                block_reason = opens_on_message(
+                    hackathon.get("start_date"),
+                    hackathon.get("start_time"),
+                    what="Submissions",
+                )
+            elif hackathon_status == "closed" and pending in ("ready", "round_not_open"):
+                pending = "hackathon_closed"
+                block_reason = closed_on_message(
+                    hackathon.get("end_date"),
+                    hackathon.get("end_time"),
+                    what="Submissions",
+                )
+
+        if submission_count >= submission_limit:
+            can_submit = False
+            can_continue_to_demo = False
+            pending = "already_submitted"
+            latest = submissions[-1]
+            if team and latest.get("student_id") != user.user_id:
+                block_reason = TEAM_SUBMISSION_LIMIT_MESSAGE
+            else:
+                block_reason = SUBMISSION_LIMIT_MESSAGE
+
+        return HackathonParticipationResponse(
+            hackathon_id=hackathon_id,
+            round_index=round_index,
+            round_title=round_title,
+            team_size_mode=bounds.mode,
+            max_team_size=bounds.max_size,
+            min_team_size=bounds.min_size,
+            team_mode_label=bounds.label,
+            working_demo_video_required=round_working_demo_video_required(hackathon, round_index),
+            auto_ai_evaluation=round_auto_ai_evaluation(hackathon, round_index),
+            github_ai_evaluation=round_github_ai_evaluation(hackathon, round_index),
+            round_published=round_is_published(round_),
+            round_status=round_status,
+            round_open=round_open,
+            enrolled=enrolled,
+            role=role,
+            team=team,
+            can_submit=can_submit,
+            can_continue_to_demo=can_continue_to_demo,
+            block_reason=block_reason,
+            pending_action=pending,
+            already_submitted=already_submitted,
+            existing_submission_id=existing_submission_id,
+            max_submissions=submission_limit,
+            submission_count=submission_count,
+            submissions_remaining=submissions_remaining,
+        )
+
+    def _assert_round_visible_to_student(
+        self,
+        hackathon: dict[str, Any],
+        round_index: int,
+        round_: dict[str, Any],
+    ) -> None:
+        if not round_is_published(round_):
+            raise ForbiddenError(
+                "This round is not published yet",
+                code="ROUND_NOT_PUBLISHED",
+            )
+
+    def _assert_round_accepts_enrollment(self, hackathon: dict[str, Any], round_index: int) -> None:
+        round_ = get_timeline_round(hackathon, round_index)
+        if not round_:
+            raise NotFoundError("Round not found", code="ROUND_NOT_FOUND")
+        self._assert_round_visible_to_student(hackathon, round_index, round_)
+        if (
+            window_status(
+                hackathon.get("start_date"),
+                hackathon.get("end_date"),
+                hackathon.get("start_time"),
+                hackathon.get("end_time"),
+                now=self._now(),
+            )
+            == "closed"
+        ):
+            raise ForbiddenError(
+                closed_on_message(
+                    hackathon.get("end_date"),
+                    hackathon.get("end_time"),
+                    what="Submissions",
+                ),
+                code="HACKATHON_CLOSED",
+            )
+        if round_student_status(round_, now=self._now()) == "closed":
+            raise ForbiddenError(
+                closed_on_message(
+                    round_.get("end_date"),
+                    round_.get("end_time"),
+                    what="This round",
+                ),
+                code="ROUND_CLOSED",
+            )
+
+    def _assert_round_open_for_submission(
+        self, hackathon: dict[str, Any], round_index: int
+    ) -> None:
+        round_ = get_timeline_round(hackathon, round_index)
+        if not round_:
+            raise NotFoundError("Round not found", code="ROUND_NOT_FOUND")
+        self._assert_round_visible_to_student(hackathon, round_index, round_)
+        hackathon_status = window_status(
+            hackathon.get("start_date"),
+            hackathon.get("end_date"),
+            hackathon.get("start_time"),
+            hackathon.get("end_time"),
+            now=self._now(),
+        )
+        if hackathon_status == "closed":
+            raise ForbiddenError(
+                closed_on_message(
+                    hackathon.get("end_date"),
+                    hackathon.get("end_time"),
+                    what="Submissions",
+                ),
+                code="HACKATHON_CLOSED",
+            )
+        if not round_open_for_submission(hackathon, round_index, now=self._now()):
+            status = round_student_status(round_, now=self._now())
+            if status == "scheduled":
+                raise ForbiddenError(
+                    opens_on_message(
+                        round_.get("start_date"),
+                        round_.get("start_time"),
+                        what="This round",
+                    ),
+                    code="ROUND_NOT_OPEN",
+                )
+            raise ForbiddenError(
+                closed_on_message(
+                    round_.get("end_date"),
+                    round_.get("end_time"),
+                    what="This round",
+                ),
+                code="ROUND_CLOSED",
+            )
+        if hackathon_status == "scheduled":
+            raise ForbiddenError(
+                opens_on_message(
+                    hackathon.get("start_date"),
+                    hackathon.get("start_time"),
+                    what="Submissions",
+                ),
+                code="HACKATHON_NOT_OPEN",
+            )
+
+    def enroll_solo(
+        self, hackathon_id: str, round_index: int, user: CurrentUser
+    ) -> HackathonParticipationResponse:
+        hackathon = self._require_hackathon(hackathon_id)
+        self._assert_visible_to_student(hackathon, user)
+        _, _, bounds = self._resolve_round(hackathon, round_index)
+        self._assert_round_accepts_enrollment(hackathon, round_index)
+        if bounds.mode == "multi":
+            raise BadRequestError(
+                "This round requires a team. Choose team leader or team member.",
+                code="TEAM_REQUIRED",
+            )
+        self._assert_student(user)
+        if self._get_enrollment_doc(hackathon_id, round_index, user.user_id):
+            raise ConflictError(
+                "You are already enrolled for this round",
+                code="ALREADY_ENROLLED",
+            )
+        now = now_ist_iso()
+        self.firebase.set_document(
+            ENROLLMENTS,
+            self._enrollment_id(hackathon_id, round_index, user.user_id),
+            {
+                "hackathon_id": hackathon_id,
+                "round_index": round_index,
+                "user_id": user.user_id,
+                "team_id": None,
+                "role": "solo",
+                "created_at": now,
+            },
+        )
+        return self.get_participation(hackathon_id, round_index, user)
+
+    def create_team(
+        self,
+        hackathon_id: str,
+        round_index: int,
+        user: CurrentUser,
+        team_name: str,
+    ) -> CreateTeamResponse:
+        hackathon = self._require_hackathon(hackathon_id)
+        self._assert_visible_to_student(hackathon, user)
+        _, round_title, bounds = self._resolve_round(hackathon, round_index)
+        self._assert_round_accepts_enrollment(hackathon, round_index)
+        if bounds.mode == "single":
+            raise BadRequestError(
+                "This round is solo-only. Enroll directly to submit.",
+                code="SOLO_HACKATHON",
+            )
+        self._assert_student(user)
+        existing = self._get_enrollment_doc(hackathon_id, round_index, user.user_id)
+        if existing:
+            if existing.get("role") == "leader" and existing.get("team_id"):
+                team_id = existing["team_id"]
+                team_doc = self.firebase.get_document(TEAMS, team_id)
+                if not team_doc:
+                    raise NotFoundError("Team not found", code="TEAM_NOT_FOUND")
+                code, join_meta = self._issue_join_code(
+                    hackathon_id, round_index, team_id, user.user_id
+                )
+                return CreateTeamResponse(
+                    team=self._team_response(
+                        team_id,
+                        team_doc,
+                        round_index=round_index,
+                        round_title=round_title,
+                    ),
+                    join_code=TeamJoinCodeResponse(
+                        code=code,
+                        expires_at=join_meta["expires_at"],
+                        expires_in_seconds=join_meta["expires_in_seconds"],
+                    ),
+                )
+            raise ConflictError(
+                "You are already enrolled for this round",
+                code="ALREADY_ENROLLED",
+            )
+
+        profile = self._student_profile(user.user_id)
+        team_id = new_uuid()
+        now = now_ist_iso()
+        leader_member = self._member_record(user, profile, role="leader", joined_at=now)
+        normalized_name = team_name.strip()
+        if not normalized_name:
+            raise BadRequestError(
+                "Team name is required",
+                code="TEAM_NAME_REQUIRED",
+            )
+        team_doc = {
+            "hackathon_id": hackathon_id,
+            "round_index": round_index,
+            "round_title": round_title,
+            "leader_id": user.user_id,
+            "team_name": normalized_name,
+            "max_members": bounds.max_size,
+            "members": [leader_member],
+            "created_at": now,
+            "updated_at": now,
+        }
+        self.firebase.set_document(TEAMS, team_id, team_doc)
+        self.firebase.set_document(
+            ENROLLMENTS,
+            self._enrollment_id(hackathon_id, round_index, user.user_id),
+            {
+                "hackathon_id": hackathon_id,
+                "round_index": round_index,
+                "user_id": user.user_id,
+                "team_id": team_id,
+                "role": "leader",
+                "created_at": now,
+            },
+        )
+        code, join_meta = self._issue_join_code(hackathon_id, round_index, team_id, user.user_id)
+        return CreateTeamResponse(
+            team=self._team_response(
+                team_id,
+                team_doc,
+                round_index=round_index,
+                round_title=round_title,
+            ),
+            join_code=TeamJoinCodeResponse(
+                code=code,
+                expires_at=join_meta["expires_at"],
+                expires_in_seconds=join_meta["expires_in_seconds"],
+            ),
+        )
+
+    def join_team(
+        self, hackathon_id: str, round_index: int, user: CurrentUser, code: str
+    ) -> JoinTeamResponse:
+        hackathon = self._require_hackathon(hackathon_id)
+        self._assert_visible_to_student(hackathon, user)
+        _, round_title, bounds = self._resolve_round(hackathon, round_index)
+        self._assert_round_accepts_enrollment(hackathon, round_index)
+        if bounds.mode == "single":
+            raise BadRequestError(
+                "This round is solo-only.",
+                code="SOLO_HACKATHON",
+            )
+        self._assert_student(user)
+        if self._get_enrollment_doc(hackathon_id, round_index, user.user_id):
+            raise ConflictError(
+                "You are already enrolled for this round",
+                code="ALREADY_ENROLLED",
+            )
+
+        code_doc_id = join_code_document_id(hackathon_id, round_index, code)
+        code_doc = self.firebase.get_document(JOIN_CODES, code_doc_id)
+        if not code_doc:
+            raise BadRequestError("Invalid or expired join code", code="INVALID_CODE")
+
+        expires_at = code_doc.get("expires_at")
+        if not expires_at or parse_to_ist(expires_at) < self._now():
+            self.firebase.delete_document(JOIN_CODES, code_doc_id)
+            raise BadRequestError("Join code has expired", code="EXPIRED")
+
+        if int(code_doc.get("round_index", -1)) != round_index:
+            raise BadRequestError("Invalid join code", code="INVALID_CODE")
+
+        team_id = code_doc.get("team_id")
+        if not team_id:
+            raise BadRequestError("Invalid join code", code="INVALID_CODE")
+
+        team_doc = self.firebase.get_document(TEAMS, team_id)
+        if (
+            not team_doc
+            or team_doc.get("hackathon_id") != hackathon_id
+            or int(team_doc.get("round_index", -1)) != round_index
+        ):
+            raise BadRequestError("Invalid join code", code="INVALID_CODE")
+
+        members = list(team_doc.get("members") or [])
+        cap = bounds.max_size
+        if cap is not None and len(members) >= cap:
+            raise ConflictError("This team is already full", code="TEAM_FULL")
+
+        if any(m.get("user_id") == user.user_id for m in members):
+            raise ConflictError("You are already on this team", code="ALREADY_ON_TEAM")
+
+        profile = self._student_profile(user.user_id)
+        now = now_ist_iso()
+        members.append(self._member_record(user, profile, role="member", joined_at=now))
+        self.firebase.update_document(
+            TEAMS,
+            team_id,
+            {"members": members, "updated_at": now},
+        )
+        self.firebase.set_document(
+            ENROLLMENTS,
+            self._enrollment_id(hackathon_id, round_index, user.user_id),
+            {
+                "hackathon_id": hackathon_id,
+                "round_index": round_index,
+                "user_id": user.user_id,
+                "team_id": team_id,
+                "role": "member",
+                "created_at": now,
+            },
+        )
+        updated = self.firebase.get_document(TEAMS, team_id) or team_doc
+        return JoinTeamResponse(
+            team=self._team_response(
+                team_id,
+                updated,
+                round_index=round_index,
+                round_title=round_title,
+            )
+        )
+
+    def refresh_join_code(
+        self, hackathon_id: str, round_index: int, user: CurrentUser
+    ) -> TeamJoinCodeResponse:
+        """Issue a new join code for an existing team leader."""
+        hackathon = self._require_hackathon(hackathon_id)
+        self._assert_visible_to_student(hackathon, user)
+        self._resolve_round(hackathon, round_index)
+        self._assert_student(user)
+        enrollment = self._get_enrollment_doc(hackathon_id, round_index, user.user_id)
+        if not enrollment or enrollment.get("role") != "leader":
+            raise ForbiddenError(
+                "Only the team leader can refresh the join code",
+                code="LEADER_ONLY",
+            )
+        team_id = enrollment.get("team_id")
+        if not team_id:
+            raise NotFoundError("Team not found", code="TEAM_NOT_FOUND")
+        code, join_meta = self._issue_join_code(hackathon_id, round_index, team_id, user.user_id)
+        return TeamJoinCodeResponse(
+            code=code,
+            expires_at=join_meta["expires_at"],
+            expires_in_seconds=join_meta["expires_in_seconds"],
+        )
+
+    def assert_submission_allowed(
+        self, hackathon_id: str, round_index: int, student_id: str
+    ) -> tuple[str, str | None]:
+        """
+        Returns ``(team_name, team_id)`` when the student may submit for a round.
+
+        Raises if not enrolled or not the team leader (team rounds).
+        """
+        hackathon = self._require_hackathon(hackathon_id)
+        self._assert_visible_to_student_id(hackathon, student_id)
+        _, _, bounds = self._resolve_round(hackathon, round_index)
+        self._assert_round_open_for_submission(hackathon, round_index)
+        enrollment = self._get_enrollment_doc(hackathon_id, round_index, student_id)
+        if not enrollment:
+            raise ForbiddenError(
+                "Enroll for this round before submitting",
+                code="NOT_ENROLLED",
+            )
+
+        role = enrollment.get("role")
+        if bounds.mode == "single" or role == "solo":
+            if role != "solo" or bounds.mode == "multi":
+                raise ForbiddenError(
+                    "Invalid enrollment for this solo round",
+                    code="NOT_ENROLLED",
+                )
+            profile = self.user_service.get_user(student_id) or {}
+            name = (profile.get("name") or profile.get("email") or "Solo").strip()
+            assert_within_submission_limit(
+                self.firebase,
+                student_id=student_id,
+                hackathon_id=hackathon_id,
+                round_index=round_index,
+                max_submissions=hackathon_max_submissions(hackathon),
+            )
+            return f"{name} (Solo)", None
+
+        if role != "leader":
+            raise ForbiddenError(
+                "Only the team leader can submit for this round",
+                code="LEADER_ONLY",
+            )
+        team_id = enrollment.get("team_id")
+        if not team_id:
+            raise ForbiddenError(
+                "Team enrollment is incomplete",
+                code="NOT_ENROLLED",
+            )
+        team_doc = self.firebase.get_document(TEAMS, team_id)
+        if not team_doc:
+            raise NotFoundError("Team not found", code="TEAM_NOT_FOUND")
+        members = list(team_doc.get("members") or [])
+        if bounds.mode == "multi" and len(members) < bounds.min_size:
+            raise ForbiddenError(
+                team_incomplete_message(bounds.min_size, bounds.max_size),
+                code="TEAM_INCOMPLETE",
+            )
+        if bounds.max_size is not None and len(members) > bounds.max_size:
+            raise ForbiddenError(
+                team_too_large_message(bounds.max_size),
+                code="TEAM_TOO_LARGE",
+            )
+        assert_within_submission_limit(
+            self.firebase,
+            student_id=student_id,
+            hackathon_id=hackathon_id,
+            round_index=round_index,
+            team_id=team_id,
+            max_submissions=hackathon_max_submissions(hackathon),
+        )
+        return str(team_doc.get("team_name") or "Team"), team_id
+
+    def _issue_join_code(
+        self,
+        hackathon_id: str,
+        round_index: int,
+        team_id: str,
+        leader_id: str,
+    ) -> tuple[str, dict[str, Any]]:
+        self._revoke_team_join_codes(hackathon_id, round_index, team_id)
+        code = generate_team_join_code()
+        now = self._now()
+        expires = now + JOIN_CODE_TTL
+        doc_id = join_code_document_id(hackathon_id, round_index, code)
+        self.firebase.set_document(
+            JOIN_CODES,
+            doc_id,
+            {
+                "hackathon_id": hackathon_id,
+                "round_index": round_index,
+                "team_id": team_id,
+                "leader_id": leader_id,
+                "code_hash": hash_team_join_code(hackathon_id, round_index, code),
+                "expires_at": expires.isoformat(),
+                "created_at": now.isoformat(),
+            },
+        )
+        return code, {
+            "expires_at": expires.isoformat(),
+            "expires_in_seconds": int(JOIN_CODE_TTL.total_seconds()),
+        }
+
+    def _revoke_team_join_codes(self, hackathon_id: str, round_index: int, team_id: str) -> None:
+        docs = self.firebase.query_collection(JOIN_CODES, "team_id", "==", team_id)
+        for doc in docs:
+            doc_id = doc.get("id")
+            if (
+                doc_id
+                and doc.get("hackathon_id") == hackathon_id
+                and int(doc.get("round_index", -1)) == round_index
+            ):
+                self.firebase.delete_document(JOIN_CODES, doc_id)
+
+    def _team_response(
+        self,
+        team_id: str,
+        team_doc: dict[str, Any],
+        *,
+        round_index: int,
+        round_title: str,
+    ) -> HackathonTeamResponse:
+        members_raw = team_doc.get("members") or []
+        members = [
+            TeamMemberSummary(
+                user_id=m["user_id"],
+                name=m.get("name") or "",
+                email=m.get("email") or "",
+                role=m.get("role") or "member",
+                joined_at=m.get("joined_at") or "",
+            )
+            for m in members_raw
+        ]
+        raw_max = team_doc.get("max_members")
+        max_members = int(raw_max) if raw_max is not None else None
+        count = len(members)
+        return HackathonTeamResponse(
+            id=team_id,
+            hackathon_id=str(team_doc.get("hackathon_id") or ""),
+            round_index=round_index,
+            round_title=round_title or str(team_doc.get("round_title") or ""),
+            team_name=str(team_doc.get("team_name") or "Team"),
+            leader_id=str(team_doc.get("leader_id") or ""),
+            max_members=max_members,
+            member_count=count,
+            members=members,
+            is_full=max_members is not None and count >= max_members,
+        )
+
+    def _require_hackathon(self, hackathon_id: str) -> dict[str, Any]:
+        hackathon = self.hackathon_service.get_hackathon(hackathon_id.strip())
+        if not hackathon:
+            raise NotFoundError("Hackathon not found", code="HACKATHON_NOT_FOUND")
+        return hackathon
+
+    def _resolve_round(
+        self, hackathon: dict[str, Any], round_index: int
+    ) -> tuple[dict[str, Any], str, TeamBounds]:
+        timeline = hackathon.get("timeline") or []
+        if round_index < 0 or round_index >= len(timeline):
+            raise NotFoundError("Round not found", code="ROUND_NOT_FOUND")
+        round_ = timeline[round_index]
+        if not isinstance(round_, dict):
+            round_ = dict(round_)
+        title = str(round_.get("title") or f"Round {round_index + 1}")
+        return round_, title, resolve_team_bounds(round_)
+
+    @staticmethod
+    def _enrollment_id(hackathon_id: str, round_index: int, user_id: str) -> str:
+        return f"{hackathon_id.strip()}_{int(round_index)}_{user_id}"
+
+    def _get_enrollment_doc(
+        self, hackathon_id: str, round_index: int, user_id: str
+    ) -> dict[str, Any] | None:
+        return self.firebase.get_document(
+            ENROLLMENTS, self._enrollment_id(hackathon_id, round_index, user_id)
+        )
+
+    def _assert_visible_to_student(self, hackathon: dict[str, Any], user: CurrentUser) -> None:
+        if user.role != "student":
+            return
+        if student_can_see(hackathon, user.university_id, user.batch_id):
+            return
+        raise ForbiddenError(
+            "This hackathon is not open to your university and batch.",
+            code="NOT_VISIBLE",
+        )
+
+    def _assert_visible_to_student_id(self, hackathon: dict[str, Any], student_id: str) -> None:
+        profile = self.user_service.get_user(student_id) or {}
+        if student_can_see(hackathon, profile.get("university_id"), profile.get("batch_id")):
+            return
+        raise ForbiddenError(
+            "This hackathon is not open to your university and batch.",
+            code="NOT_VISIBLE",
+        )
+
+    def _assert_student(self, user: CurrentUser) -> None:
+        if user.role != "student":
+            raise ForbiddenError("Only students can join hackathon teams", code="FORBIDDEN")
+
+    def _student_profile(self, user_id: str) -> dict[str, Any]:
+        profile = self.user_service.get_user(user_id)
+        if not profile:
+            raise NotFoundError("Student profile not found", code="USER_NOT_FOUND")
+        return profile
+
+    @staticmethod
+    def _member_record(
+        user: CurrentUser,
+        profile: dict[str, Any],
+        *,
+        role: str,
+        joined_at: str,
+    ) -> dict[str, Any]:
+        return {
+            "user_id": user.user_id,
+            "name": profile.get("name") or user.email,
+            "email": profile.get("email") or user.email,
+            "role": role,
+            "joined_at": joined_at,
+        }

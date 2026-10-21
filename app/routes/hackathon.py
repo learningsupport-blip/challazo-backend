@@ -1,0 +1,1078 @@
+"""
+Hackathon routes.
+
+    POST   /hackathons            -> admin creates a hackathon (multipart, banner optional)
+    POST   /hackathons/{id}/duplicate -> admin copies one into an editable draft
+    GET    /hackathons            -> list hackathons (any authenticated user)
+    GET    /hackathons/catalog    -> homepage cards (public; published rounds only)
+    GET    /hackathons/{id}       -> get a single hackathon
+    PATCH  /hackathons/{id}       -> admin updates a hackathon (multipart, banner optional)
+    DELETE /hackathons/{id}       -> admin deletes a hackathon
+    POST   /hackathons/{id}/rounds/{index}/publish -> admin publishes a round
+    GET    /hackathons/{id}/rounds/{index}/leaderboard -> ranked results
+    POST   /hackathons/{id}/rounds/{index}/leaderboard/publish -> admin publishes ranks (no email)
+    GET    /hackathons/{id}/rounds/{index}/winners -> super admin: preview top N
+    POST   /hackathons/{id}/rounds/{index}/winners/announce -> super admin: email those places
+    GET    /hackathons/{id}/video-analysis-prompts -> admin: Video Analysis prompts for Settings
+    PUT    /hackathons/{id}/video-analysis-prompts -> admin: save hackathon-specific prompts
+    DELETE /hackathons/{id}/video-analysis-prompts -> admin: reset both to global Video Analysis
+    DELETE /hackathons/{id}/video-analysis-prompts/{key} -> admin: reset one prompt
+    GET    /hackathons/{id}/report-publishing -> admin: auto-publish toggle + counts
+    PUT    /hackathons/{id}/report-publishing -> admin: set auto-publish (publishes backlog)
+    GET    /hackathons/{id}/submission-limit -> admin: max submissions per round
+    PUT    /hackathons/{id}/submission-limit -> admin: set max submissions (1–3)
+    GET    /hackathons/{id}/evaluators -> admin: roster for settings and the dropdown
+    PUT    /hackathons/{id}/evaluators -> admin: replace which evaluators can be assigned
+    GET    /hackathons/{id}/visibility -> admin: universities and batches for Settings
+    PUT    /hackathons/{id}/visibility -> admin: who can see this hackathon
+    GET    /hackathons/{id}/evaluation-approvals -> super admin: pending review counts
+    POST   /hackathons/{id}/evaluation-approvals/approve-all -> super admin: approve them
+"""
+
+import json
+import logging
+
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
+from pydantic import ValidationError
+
+from app.middleware.auth_middleware import (
+    get_admin_user,
+    get_current_user,
+    get_optional_current_user,
+    get_super_admin_user,
+)
+from app.exceptions import AppError
+from app.models.hackathon_model import (
+    HackathonCatalogItem,
+    HackathonCreateRequest,
+    HackathonPrizes,
+    HackathonResponse,
+    HackathonUpdateRequest,
+    HackathonEvaluatorsResponse,
+    HackathonEvaluatorsUpdateRequest,
+    ReportPublishingResponse,
+    ReportPublishingUpdateRequest,
+    SubmissionLimitResponse,
+    SubmissionLimitUpdateRequest,
+    HackathonVisibilityResponse,
+    HackathonVisibilityUpdateRequest,
+    BulkApproveEvaluationsResponse,
+    EvaluationApprovalSummary,
+    TimelineRound,
+)
+from app.models.round_model import PublishRoundResponse
+from app.models.leaderboard_model import (
+    AnnounceWinnersRequest,
+    LeaderboardResponse,
+    PublishLeaderboardRequest,
+    PublishLeaderboardResponse,
+    WinnerAnnouncementResponse,
+)
+from app.models.evaluation_prompt_model import (
+    HackathonVideoAnalysisPromptsResponse,
+    HackathonVideoAnalysisPromptsUpdateRequest,
+)
+from app.models.theme_model import ThemeResponse
+from app.models.user_model import CurrentUser
+from app.dependencies import (
+    get_evaluation_prompt_service,
+    get_hackathon_draft_service,
+    get_hackathon_service,
+    get_leaderboard_service,
+    get_submission_service,
+)
+from app.services.evaluation_prompt_service import EvaluationPromptService
+from app.services.hackathon_draft_service import HackathonDraftService
+from app.services.hackathon_service import HackathonService
+from app.services.leaderboard_service import LeaderboardService
+from app.services.submission_service import SubmissionService
+from app.models.hackathon_draft_model import (
+    HackathonDraftResponse,
+    HackathonDraftSummary,
+    HackathonDraftUpdateRequest,
+)
+from app.utils.async_io import run_sync
+from app.utils.hackathon_visibility import visible_to_viewer
+
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/hackathons", tags=["hackathons"])
+
+
+async def _to_response(
+    service: HackathonService,
+    hackathon: dict,
+    *,
+    current_user: CurrentUser | None = None,
+) -> HackathonResponse:
+    if current_user and current_user.role == "student":
+        enriched = await run_sync(service.filter_timeline_for_student, hackathon)
+    else:
+        enriched = await run_sync(service.enrich_hackathon_for_response, hackathon)
+    return HackathonResponse(**enriched)
+
+
+def _parse_json_field(raw: str | None, field_name: str, default):
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} must be valid JSON: {str(e)}",
+        ) from e
+
+
+def _parse_form_bool(
+    raw: str | None,
+    *,
+    default: bool = True,
+    field_name: str = "value",
+) -> bool:
+    """Parse multipart bool strings; empty/omitted uses default."""
+    if raw is None or str(raw).strip() == "":
+        return default
+    value = str(raw).strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"{field_name} must be true or false",
+    )
+
+
+async def _read_banner(banner: UploadFile | None) -> tuple[str, bytes, str] | None:
+    if banner is None:
+        return None
+    payload = await banner.read()
+    if not payload:
+        return None
+    return (banner.filename or "banner", payload, banner.content_type or "")
+
+
+# --- Draft routes (must be registered before /{hackathon_id} paths) ---
+
+
+@router.post("/drafts", response_model=HackathonDraftResponse, status_code=201)
+async def create_hackathon_draft(
+    payload: HackathonDraftUpdateRequest | None = Body(None),
+    admin: CurrentUser = Depends(get_admin_user),
+    draft_service: HackathonDraftService = Depends(get_hackathon_draft_service),
+) -> HackathonDraftResponse:
+    """Create an empty hackathon draft (admin wizard cart)."""
+    draft = await run_sync(
+        draft_service.create_draft,
+        admin.user_id,
+        payload,
+    )
+    return HackathonDraftResponse(**draft)
+
+
+@router.get("/drafts", response_model=list[HackathonDraftSummary])
+async def list_hackathon_drafts(
+    admin: CurrentUser = Depends(get_admin_user),
+    draft_service: HackathonDraftService = Depends(get_hackathon_draft_service),
+) -> list[HackathonDraftSummary]:
+    """List in-progress hackathon drafts for the admin portal."""
+    _ = admin
+    drafts = await run_sync(draft_service.list_drafts)
+    return [HackathonDraftSummary(**item) for item in drafts]
+
+
+@router.get("/drafts/{draft_id}", response_model=HackathonDraftResponse)
+async def get_hackathon_draft(
+    draft_id: str,
+    admin: CurrentUser = Depends(get_admin_user),
+    draft_service: HackathonDraftService = Depends(get_hackathon_draft_service),
+) -> HackathonDraftResponse:
+    """Load a single draft to resume the create-hackathon wizard."""
+    _ = admin
+    draft = await run_sync(draft_service.get_draft, draft_id)
+    if not draft:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Draft not found",
+        )
+    return HackathonDraftResponse(**draft)
+
+
+@router.patch("/drafts/{draft_id}", response_model=HackathonDraftResponse)
+async def update_hackathon_draft(
+    draft_id: str,
+    payload: HackathonDraftUpdateRequest,
+    admin: CurrentUser = Depends(get_admin_user),
+    draft_service: HackathonDraftService = Depends(get_hackathon_draft_service),
+) -> HackathonDraftResponse:
+    """
+    Save-and-continue for one wizard section (partial fields allowed).
+
+    Send ``current_step`` and append to ``completed_steps`` when the admin
+    clicks **Save & continue** on a section.
+    """
+    _ = admin
+    try:
+        draft = await run_sync(draft_service.update_draft, draft_id, payload)
+    except AppError:
+        raise
+    return HackathonDraftResponse(**draft)
+
+
+@router.post("/drafts/{draft_id}/banner", response_model=HackathonDraftResponse)
+async def upload_hackathon_draft_banner(
+    draft_id: str,
+    banner: UploadFile = File(..., description="Hackathon banner image"),
+    admin: CurrentUser = Depends(get_admin_user),
+    draft_service: HackathonDraftService = Depends(get_hackathon_draft_service),
+) -> HackathonDraftResponse:
+    """Upload or replace the banner on a draft."""
+    _ = admin
+    banner_payload = await _read_banner(banner)
+    if not banner_payload:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Banner file is required",
+        )
+    try:
+        draft = await run_sync(
+            draft_service.update_draft,
+            draft_id,
+            HackathonDraftUpdateRequest(current_step="banner"),
+            banner=banner_payload,
+        )
+    except AppError:
+        raise
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    return HackathonDraftResponse(**draft)
+
+
+@router.post(
+    "/drafts/{draft_id}/publish",
+    response_model=HackathonResponse,
+    status_code=201,
+)
+async def publish_hackathon_draft(
+    draft_id: str,
+    admin: CurrentUser = Depends(get_admin_user),
+    draft_service: HackathonDraftService = Depends(get_hackathon_draft_service),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> HackathonResponse:
+    """
+    Validate the draft, create the real hackathon, and delete the draft.
+    """
+    try:
+        hackathon = await run_sync(
+            draft_service.publish_draft,
+            draft_id,
+            admin.user_id,
+        )
+    except AppError:
+        raise
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    return await _to_response(service, hackathon)
+
+
+@router.delete("/drafts/{draft_id}", status_code=200)
+async def delete_hackathon_draft(
+    draft_id: str,
+    admin: CurrentUser = Depends(get_admin_user),
+    draft_service: HackathonDraftService = Depends(get_hackathon_draft_service),
+) -> dict:
+    """Discard a draft."""
+    _ = admin
+    deleted = await run_sync(draft_service.delete_draft, draft_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Draft not found",
+        )
+    return {"message": "Draft deleted successfully"}
+
+
+@router.post(
+    "/{hackathon_id}/duplicate",
+    response_model=HackathonDraftResponse,
+    status_code=201,
+)
+async def duplicate_hackathon(
+    hackathon_id: str,
+    admin: CurrentUser = Depends(get_admin_user),
+    draft_service: HackathonDraftService = Depends(get_hackathon_draft_service),
+) -> HackathonDraftResponse:
+    """
+    Copy an existing hackathon into a creation draft.
+
+    The admin edits the copy in the wizard and publishes it. Rounds stay
+    unpublished. Submissions and scores are not copied.
+    """
+    draft = await run_sync(draft_service.duplicate_hackathon, hackathon_id, admin.user_id)
+    return HackathonDraftResponse(**draft)
+
+
+@router.post("", response_model=HackathonResponse, status_code=201)
+async def create_hackathon(
+    name: str = Form(..., min_length=1, max_length=200),
+    description: str = Form(..., min_length=1, max_length=10000),
+    start_date: str = Form(..., description="ISO date YYYY-MM-DD"),
+    end_date: str = Form(..., description="ISO date YYYY-MM-DD"),
+    start_time: str
+    | None = Form(
+        None,
+        description="IST start clock HH:MM. Omit for 00:00. Submissions open at this minute.",
+    ),
+    end_time: str
+    | None = Form(
+        None,
+        description="IST end clock HH:MM. Omit for 23:59. That minute is still open.",
+    ),
+    guidelines: str = Form(
+        ...,
+        min_length=1,
+        max_length=10000,
+        description="Participation guidelines for students",
+    ),
+    evaluator_guidelines: str = Form(
+        ...,
+        min_length=1,
+        max_length=10000,
+        description="Guidelines for evaluators reviewing submissions",
+    ),
+    prizes: str = Form(
+        ...,
+        description='JSON: {"winner": "...", "first_runner_up": "...", "second_runner_up": "..."}',
+    ),
+    theme_ids: str = Form(
+        ...,
+        description='JSON array of theme ids, e.g. ["id1","id2"]',
+    ),
+    timeline: str
+    | None = Form(
+        None,
+        description=(
+            'JSON array of rounds, e.g. [{"title":"Round 1","start_date":"YYYY-MM-DD",'
+            '"start_time":"09:00","end_date":"YYYY-MM-DD","end_time":"18:00",'
+            '"evaluation_requirement_id":"…","max_team_size":2,'
+            '"working_demo_video_required":true,"auto_ai_evaluation":false}]'
+        ),
+    ),
+    banner: UploadFile
+    | None = File(None, description="Optional hackathon banner image (jpeg/png/webp/gif)"),
+    hackathon_url: str
+    | None = Form(
+        None,
+        max_length=2000,
+        description="Official hackathon website URL (shown on student dashboard)",
+    ),
+    admin: CurrentUser = Depends(get_admin_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> HackathonResponse:
+    """
+    Create a hackathon. Admin only.
+
+    ``prizes``, ``theme_ids``, and ``timeline`` are sent as JSON strings within
+    the multipart form; ``banner`` and ``hackathon_url`` are optional.
+    """
+    prizes_data = _parse_json_field(prizes, "prizes", {})
+    theme_ids_data = _parse_json_field(theme_ids, "theme_ids", [])
+    timeline_data = _parse_json_field(timeline, "timeline", [])
+
+    try:
+        payload = HackathonCreateRequest(
+            name=name,
+            description=description,
+            start_date=start_date,
+            end_date=end_date,
+            start_time=start_time,
+            end_time=end_time,
+            guidelines=guidelines,
+            evaluator_guidelines=evaluator_guidelines,
+            theme_ids=theme_ids_data,
+            hackathon_url=hackathon_url,
+            prizes=HackathonPrizes(**prizes_data),
+            timeline=[TimelineRound(**item) for item in timeline_data],
+        )
+    except (ValidationError, ValueError, TypeError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+    banner_payload = await _read_banner(banner)
+
+    try:
+        hackathon = await run_sync(
+            service.create_hackathon,
+            request=payload,
+            created_by=admin.user_id,
+            banner=banner_payload,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except Exception as e:
+        logger.error("Hackathon creation failed: %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create hackathon",
+        ) from e
+
+    return await _to_response(service, hackathon)
+
+
+@router.get("", response_model=list[HackathonResponse])
+async def list_hackathons(
+    current_user: CurrentUser = Depends(get_current_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> list[HackathonResponse]:
+    """List hackathons. Students only receive ones open to their university and batch."""
+    hackathons = await run_sync(service.list_hackathons)
+    if current_user.role == "student":
+        hackathons = [item for item in hackathons if visible_to_viewer(item, current_user)]
+    return [await _to_response(service, item, current_user=current_user) for item in hackathons]
+
+
+@router.get("/catalog", response_model=list[HackathonCatalogItem])
+async def list_hackathon_catalog(
+    include_closed: bool = Query(
+        True,
+        description="When false, omit hackathons whose featured round has ended.",
+    ),
+    service: HackathonService = Depends(get_hackathon_service),
+    viewer: CurrentUser | None = Depends(get_optional_current_user),
+) -> list[HackathonCatalogItem]:
+    """
+    Homepage listing. Reads live Firestore hackathons and attaches computed
+    badges: Open, Closing soon, Upcoming, Closed, Solo, Team.
+
+    Public when nobody is signed in: only hackathons opened to every university
+    and batch. A signed-in student also sees hackathons for their campus.
+    """
+    items = await run_sync(
+        service.list_hackathon_catalog,
+        include_closed=include_closed,
+        viewer=viewer,
+    )
+    return [HackathonCatalogItem(**item) for item in items]
+
+
+def _prompt_http_error(exc: ValueError) -> HTTPException:
+    message = str(exc)
+    code = (
+        status.HTTP_404_NOT_FOUND if "not found" in message.lower() else status.HTTP_400_BAD_REQUEST
+    )
+    return HTTPException(status_code=code, detail=message)
+
+
+@router.get(
+    "/{hackathon_id}/video-analysis-prompts",
+    response_model=HackathonVideoAnalysisPromptsResponse,
+)
+async def get_hackathon_video_analysis_prompts(
+    hackathon_id: str,
+    admin: CurrentUser = Depends(get_admin_user),
+    prompt_service: EvaluationPromptService = Depends(get_evaluation_prompt_service),
+) -> HackathonVideoAnalysisPromptsResponse:
+    """
+    Video Analysis prompts for this hackathon's Settings page.
+
+    Defaults to Application → Video Analysis until the admin saves an override.
+    """
+    _ = admin
+    try:
+        payload = await run_sync(prompt_service.list_hackathon_prompts, hackathon_id)
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return HackathonVideoAnalysisPromptsResponse(**payload)
+
+
+@router.put(
+    "/{hackathon_id}/video-analysis-prompts",
+    response_model=HackathonVideoAnalysisPromptsResponse,
+)
+async def update_hackathon_video_analysis_prompts(
+    hackathon_id: str,
+    request: HackathonVideoAnalysisPromptsUpdateRequest,
+    admin: CurrentUser = Depends(get_admin_user),
+    prompt_service: EvaluationPromptService = Depends(get_evaluation_prompt_service),
+) -> HackathonVideoAnalysisPromptsResponse:
+    """Save hackathon-specific Validity checklist and/or Video analysis templates."""
+    try:
+        payload = await run_sync(
+            prompt_service.update_hackathon_prompts,
+            hackathon_id,
+            [item.model_dump() for item in request.prompts],
+            admin.user_id,
+        )
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return HackathonVideoAnalysisPromptsResponse(**payload)
+
+
+@router.delete(
+    "/{hackathon_id}/video-analysis-prompts",
+    response_model=HackathonVideoAnalysisPromptsResponse,
+)
+async def reset_hackathon_video_analysis_prompts(
+    hackathon_id: str,
+    admin: CurrentUser = Depends(get_admin_user),
+    prompt_service: EvaluationPromptService = Depends(get_evaluation_prompt_service),
+) -> HackathonVideoAnalysisPromptsResponse:
+    """Clear both overrides; evaluation uses Application → Video Analysis again."""
+    _ = admin
+    try:
+        payload = await run_sync(prompt_service.reset_hackathon_prompt, hackathon_id, None)
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return HackathonVideoAnalysisPromptsResponse(**payload)
+
+
+@router.delete(
+    "/{hackathon_id}/video-analysis-prompts/{prompt_key}",
+    response_model=HackathonVideoAnalysisPromptsResponse,
+)
+async def reset_one_hackathon_video_analysis_prompt(
+    hackathon_id: str,
+    prompt_key: str,
+    admin: CurrentUser = Depends(get_admin_user),
+    prompt_service: EvaluationPromptService = Depends(get_evaluation_prompt_service),
+) -> HackathonVideoAnalysisPromptsResponse:
+    """Clear one override (``checklist`` or ``analyze_video``)."""
+    _ = admin
+    try:
+        payload = await run_sync(
+            prompt_service.reset_hackathon_prompt,
+            hackathon_id,
+            prompt_key,
+        )
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return HackathonVideoAnalysisPromptsResponse(**payload)
+
+
+@router.get(
+    "/{hackathon_id}/report-publishing",
+    response_model=ReportPublishingResponse,
+)
+async def get_report_publishing(
+    hackathon_id: str,
+    admin: CurrentUser = Depends(get_admin_user),
+    service: SubmissionService = Depends(get_submission_service),
+) -> ReportPublishingResponse:
+    """
+    Auto-publish setting and how many approved reports are waiting.
+
+    ``unpublished_approved_count`` is what turning the toggle on will release.
+    """
+    _ = admin
+    try:
+        payload = await run_sync(service.report_publishing_settings, hackathon_id)
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return ReportPublishingResponse(**payload)
+
+
+@router.put(
+    "/{hackathon_id}/report-publishing",
+    response_model=ReportPublishingResponse,
+)
+async def update_report_publishing(
+    hackathon_id: str,
+    request: ReportPublishingUpdateRequest,
+    admin: CurrentUser = Depends(get_admin_user),
+    service: SubmissionService = Depends(get_submission_service),
+) -> ReportPublishingResponse:
+    """
+    Turn auto-publish on or off.
+
+    On enables immediate publish for later approvals and publishes every
+    report that is already approved but not yet visible to students.
+    """
+    try:
+        payload = await run_sync(
+            service.set_auto_publish_reports,
+            hackathon_id,
+            request.auto_publish_reports,
+            admin.user_id,
+        )
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return ReportPublishingResponse(**payload)
+
+
+@router.get(
+    "/{hackathon_id}/submission-limit",
+    response_model=SubmissionLimitResponse,
+)
+async def get_submission_limit(
+    hackathon_id: str,
+    admin: CurrentUser = Depends(get_admin_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> SubmissionLimitResponse:
+    """How many times a student or team may submit for each round. Default 1."""
+    _ = admin
+    try:
+        payload = await run_sync(service.get_submission_limit, hackathon_id)
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return SubmissionLimitResponse(**payload)
+
+
+@router.put(
+    "/{hackathon_id}/submission-limit",
+    response_model=SubmissionLimitResponse,
+)
+async def update_submission_limit(
+    hackathon_id: str,
+    request: SubmissionLimitUpdateRequest,
+    admin: CurrentUser = Depends(get_admin_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> SubmissionLimitResponse:
+    """Set the per-round submission cap to 1, 2, or 3."""
+    _ = admin
+    try:
+        payload = await run_sync(
+            service.set_submission_limit,
+            hackathon_id,
+            request.max_submissions,
+        )
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return SubmissionLimitResponse(**payload)
+
+
+@router.get(
+    "/{hackathon_id}/visibility",
+    response_model=HackathonVisibilityResponse,
+)
+async def get_hackathon_visibility(
+    hackathon_id: str,
+    admin: CurrentUser = Depends(get_admin_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> HackathonVisibilityResponse:
+    """Universities, batches, and which of them can see this hackathon."""
+    _ = admin
+    try:
+        payload = await run_sync(service.get_visibility, hackathon_id)
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return HackathonVisibilityResponse(**payload)
+
+
+@router.put(
+    "/{hackathon_id}/visibility",
+    response_model=HackathonVisibilityResponse,
+)
+async def update_hackathon_visibility(
+    hackathon_id: str,
+    request: HackathonVisibilityUpdateRequest,
+    admin: CurrentUser = Depends(get_admin_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> HackathonVisibilityResponse:
+    """Choose the universities and batches whose students see this hackathon."""
+    _ = admin
+    try:
+        payload = await run_sync(service.set_visibility, hackathon_id, request)
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return HackathonVisibilityResponse(**payload)
+
+
+@router.get(
+    "/{hackathon_id}/evaluation-approvals",
+    response_model=EvaluationApprovalSummary,
+)
+async def get_evaluation_approvals(
+    hackathon_id: str,
+    super_admin: CurrentUser = Depends(get_super_admin_user),
+    service: SubmissionService = Depends(get_submission_service),
+) -> EvaluationApprovalSummary:
+    """How many evaluator-submitted reviews are waiting for Super Admin."""
+    _ = super_admin
+    try:
+        payload = await run_sync(service.evaluation_approval_summary, hackathon_id)
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return EvaluationApprovalSummary(**payload)
+
+
+@router.post(
+    "/{hackathon_id}/evaluation-approvals/approve-all",
+    response_model=BulkApproveEvaluationsResponse,
+)
+async def bulk_approve_evaluations(
+    hackathon_id: str,
+    super_admin: CurrentUser = Depends(get_super_admin_user),
+    service: SubmissionService = Depends(get_submission_service),
+) -> BulkApproveEvaluationsResponse:
+    """
+    Approve every evaluation an evaluator has submitted for this hackathon.
+
+    Each approval uses the score already on the submission. Those scores are
+    then eligible for the leaderboard. Students still see the board only after
+    that round's leaderboard is published.
+    """
+    try:
+        payload = await run_sync(
+            service.bulk_approve_evaluations,
+            hackathon_id,
+            super_admin.user_id,
+        )
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return BulkApproveEvaluationsResponse(**payload)
+
+
+@router.get(
+    "/{hackathon_id}/evaluators",
+    response_model=HackathonEvaluatorsResponse,
+)
+async def get_hackathon_evaluators(
+    hackathon_id: str,
+    admin: CurrentUser = Depends(get_admin_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> HackathonEvaluatorsResponse:
+    """
+    Approved evaluators and which of them can be assigned on this hackathon.
+
+    The submissions Evaluator dropdown uses the rows where ``assigned`` is true.
+    """
+    _ = admin
+    try:
+        payload = await run_sync(service.list_hackathon_evaluators, hackathon_id)
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return HackathonEvaluatorsResponse(**payload)
+
+
+@router.put(
+    "/{hackathon_id}/evaluators",
+    response_model=HackathonEvaluatorsResponse,
+)
+async def update_hackathon_evaluators(
+    hackathon_id: str,
+    request: HackathonEvaluatorsUpdateRequest,
+    admin: CurrentUser = Depends(get_admin_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> HackathonEvaluatorsResponse:
+    """Replace this hackathon's evaluator roster with an approved subset."""
+    _ = admin
+    try:
+        payload = await run_sync(
+            service.set_hackathon_evaluators,
+            hackathon_id,
+            request.evaluator_ids,
+        )
+    except ValueError as e:
+        raise _prompt_http_error(e) from e
+    return HackathonEvaluatorsResponse(**payload)
+
+
+@router.get("/{hackathon_id}/themes", response_model=list[ThemeResponse])
+async def list_hackathon_themes(
+    hackathon_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> list[ThemeResponse]:
+    """
+    Themes released for this hackathon.
+
+    Students use this list on the submission form to pick a theme.
+    """
+    hackathon = await run_sync(service.get_hackathon, hackathon_id)
+    if not hackathon or not visible_to_viewer(hackathon, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Hackathon not found",
+        )
+    themes = await run_sync(service.get_hackathon_themes, hackathon_id)
+    if themes is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Hackathon not found",
+        )
+    return [ThemeResponse(**item) for item in themes]
+
+
+@router.get("/{hackathon_id}", response_model=HackathonResponse)
+async def get_hackathon(
+    hackathon_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> HackathonResponse:
+    """Get a single hackathon by id (includes resolved ``themes``)."""
+    hackathon = await run_sync(service.get_hackathon, hackathon_id)
+    if not hackathon or not visible_to_viewer(hackathon, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Hackathon not found",
+        )
+    return await _to_response(service, hackathon, current_user=current_user)
+
+
+@router.post(
+    "/{hackathon_id}/rounds/{round_index}/publish",
+    response_model=PublishRoundResponse,
+    status_code=200,
+)
+async def publish_hackathon_round(
+    hackathon_id: str,
+    round_index: int,
+    admin: CurrentUser = Depends(get_admin_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> PublishRoundResponse:
+    """
+    Publish a timeline round for students (admin only).
+
+    Validates the IST window: cannot publish after the round end minute.
+    Students only see published rounds. Submissions open at ``start_time``
+    and stay open through ``end_time`` (missing times are 00:00 and 23:59).
+    """
+    try:
+        result = await run_sync(
+            service.publish_round,
+            hackathon_id,
+            round_index,
+            admin.user_id,
+        )
+    except AppError:
+        raise
+    round_payload = TimelineRound(**result["round"])
+    return PublishRoundResponse(
+        hackathon_id=result["hackathon_id"],
+        round_index=result["round_index"],
+        round=round_payload,
+    )
+
+
+@router.get(
+    "/{hackathon_id}/rounds/{round_index}/leaderboard",
+    response_model=LeaderboardResponse,
+)
+async def get_round_leaderboard(
+    hackathon_id: str,
+    round_index: int,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: LeaderboardService = Depends(get_leaderboard_service),
+    hackathon_service: HackathonService = Depends(get_hackathon_service),
+) -> LeaderboardResponse:
+    """
+    Ranked results for one round (highest ``final_score`` first).
+
+    Admin and evaluators always get a preview. Students only after the admin
+    publishes the leaderboard, and only when the hackathon is open to them.
+    """
+    hackathon = await run_sync(hackathon_service.get_hackathon, hackathon_id)
+    if not hackathon or not visible_to_viewer(hackathon, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Hackathon not found",
+        )
+    result = await run_sync(
+        service.get_leaderboard,
+        hackathon_id,
+        round_index,
+        current_user,
+    )
+    return LeaderboardResponse(**result)
+
+
+@router.post(
+    "/{hackathon_id}/rounds/{round_index}/leaderboard/publish",
+    response_model=PublishLeaderboardResponse,
+)
+async def publish_round_leaderboard(
+    hackathon_id: str,
+    round_index: int,
+    request: PublishLeaderboardRequest | None = Body(None),
+    admin: CurrentUser = Depends(get_admin_user),
+    service: LeaderboardService = Depends(get_leaderboard_service),
+) -> PublishLeaderboardResponse:
+    """
+    Publish (or unpublish) the round leaderboard.
+
+    Ranking includes only submissions with ``review_status=approved``.
+    Students see the board on the hackathon page. This does not send email.
+    """
+    payload = request or PublishLeaderboardRequest()
+    result = await run_sync(
+        service.publish_leaderboard,
+        hackathon_id,
+        round_index,
+        admin.user_id,
+        publish=payload.publish,
+        notify=payload.notify,
+        current_user=admin,
+    )
+    return PublishLeaderboardResponse(**result)
+
+
+@router.get(
+    "/{hackathon_id}/rounds/{round_index}/winners",
+    response_model=WinnerAnnouncementResponse,
+)
+async def preview_round_winners(
+    hackathon_id: str,
+    round_index: int,
+    top_n: int = Query(5, ge=1, le=100),
+    super_admin: CurrentUser = Depends(get_super_admin_user),
+    service: LeaderboardService = Depends(get_leaderboard_service),
+) -> WinnerAnnouncementResponse:
+    """Who would receive a winner email for this top N. Does not send mail."""
+    _ = super_admin
+    result = await run_sync(service.preview_winners, hackathon_id, round_index, top_n)
+    return WinnerAnnouncementResponse(**result)
+
+
+@router.post(
+    "/{hackathon_id}/rounds/{round_index}/winners/announce",
+    response_model=WinnerAnnouncementResponse,
+)
+async def announce_round_winners(
+    hackathon_id: str,
+    round_index: int,
+    request: AnnounceWinnersRequest,
+    super_admin: CurrentUser = Depends(get_super_admin_user),
+    service: LeaderboardService = Depends(get_leaderboard_service),
+) -> WinnerAnnouncementResponse:
+    """
+    Email the top places for this round.
+
+    Rank 1 is Winner (1st prize), rank 2 is 1st runner-up (2nd prize),
+    rank 3 is 2nd runner-up, and later places are 4th, 5th, and so on.
+    """
+    result = await run_sync(
+        service.announce_winners,
+        hackathon_id,
+        round_index,
+        request.top_n,
+        super_admin.user_id,
+    )
+    return WinnerAnnouncementResponse(**result)
+
+
+@router.patch("/{hackathon_id}", response_model=HackathonResponse)
+async def update_hackathon(
+    hackathon_id: str,
+    name: str | None = Form(None, max_length=200),
+    description: str | None = Form(None, max_length=10000),
+    start_date: str | None = Form(None),
+    end_date: str | None = Form(None),
+    start_time: str | None = Form(None, description="IST HH:MM. Omit to leave unchanged."),
+    end_time: str | None = Form(None, description="IST HH:MM. Omit to leave unchanged."),
+    guidelines: str
+    | None = Form(
+        None,
+        max_length=10000,
+        description="Participation guidelines for students",
+    ),
+    evaluator_guidelines: str
+    | None = Form(
+        None,
+        max_length=10000,
+        description="Guidelines for evaluators (omit to leave unchanged)",
+    ),
+    prizes: str | None = Form(None),
+    theme_ids: str | None = Form(None, description="JSON array of theme ids"),
+    timeline: str | None = Form(None),
+    banner: UploadFile | None = File(None),
+    hackathon_url: str
+    | None = Form(
+        None,
+        max_length=2000,
+        description="Official hackathon website URL (omit to leave unchanged)",
+    ),
+    admin: CurrentUser = Depends(get_admin_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> HackathonResponse:
+    """Update a hackathon (partial). Admin only."""
+    prizes_data = _parse_json_field(prizes, "prizes", None)
+    theme_ids_data = _parse_json_field(theme_ids, "theme_ids", None)
+    timeline_data = _parse_json_field(timeline, "timeline", None)
+
+    update_kwargs: dict = {
+        "name": name,
+        "description": description,
+        "start_date": start_date,
+        "end_date": end_date,
+        "start_time": start_time,
+        "end_time": end_time,
+        "guidelines": guidelines,
+        "evaluator_guidelines": evaluator_guidelines,
+        "theme_ids": theme_ids_data,
+        "prizes": HackathonPrizes(**prizes_data) if prizes_data is not None else None,
+        "timeline": (
+            [TimelineRound(**item) for item in timeline_data] if timeline_data is not None else None
+        ),
+    }
+    # Only touch hackathon_url when the form field is present (allows clearing).
+    if hackathon_url is not None:
+        update_kwargs["hackathon_url"] = hackathon_url
+
+    try:
+        payload = HackathonUpdateRequest(**update_kwargs)
+    except (ValidationError, ValueError, TypeError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+    banner_payload = await _read_banner(banner)
+
+    try:
+        hackathon = await run_sync(
+            service.update_hackathon,
+            hackathon_id=hackathon_id,
+            request=payload,
+            banner=banner_payload,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+    if not hackathon:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Hackathon not found",
+        )
+
+    return await _to_response(service, hackathon)
+
+
+@router.delete("/{hackathon_id}", status_code=200)
+async def delete_hackathon(
+    hackathon_id: str,
+    admin: CurrentUser = Depends(get_admin_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> dict:
+    """Delete a hackathon. Admin only."""
+    deleted = await run_sync(service.delete_hackathon, hackathon_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Hackathon not found",
+        )
+    return {"message": "Hackathon deleted successfully"}

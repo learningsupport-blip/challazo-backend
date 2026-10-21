@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID}
+      - FIREBASE_PRIVATE_KEY=${FIREBASE_PRIVATE_KEY}
+      - FIREBASE_CLIENT_EMAIL=${FIREBASE_CLIENT_EMAIL}
+      - FIREBASE_WEB_API_KEY=${FIREBASE_WEB_API_KEY}
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
+      - GOOGLE_CLOUD_LOCATION=${GOOGLE_CLOUD_LOCATION}
+      - EVALUATION_BUCKET_NAME=${EVALUATION_BUCKET_NAME}
+      - GEMINI_MODEL=${GEMINI_MODEL}
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - PORT=8000
+    volumes:
+      - ./app:/app/app
+    command: sh -c "exec uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8000}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  # Optional: for development with hot-reload
+  dev:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID}
+      - FIREBASE_PRIVATE_KEY=${FIREBASE_PRIVATE_KEY}
+      - FIREBASE_CLIENT_EMAIL=${FIREBASE_CLIENT_EMAIL}
+      - FIREBASE_WEB_API_KEY=${FIREBASE_WEB_API_KEY}
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
+      - GOOGLE_CLOUD_LOCATION=${GOOGLE_CLOUD_LOCATION}
+      - EVALUATION_BUCKET_NAME=${EVALUATION_BUCKET_NAME}
+      - GEMINI_MODEL=${GEMINI_MODEL}
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - PORT=8000
+    volumes:
+      - ./app:/app/app
+    command: sh -c "exec uvicorn app.main:app --host 0.0.0.0 --port $${PORT:-8000} --reload"
+    profiles:
+      - dev

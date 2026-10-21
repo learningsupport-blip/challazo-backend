@@ -1,0 +1,709 @@
+"""OTP hashing, expiry, attempt limits, and register complete happy path."""
+
+from datetime import datetime, timedelta
+
+import pytest
+
+from app.exceptions import (
+    BadRequestError,
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    TooManyRequestsError,
+)
+from app.models.verification_model import (
+    EmailSendOtpRequest,
+    EmailVerifyOtpRequest,
+    RegisterCompleteRequest,
+    RegisterStartRequest,
+    VerifyPhoneTokenRequest,
+)
+from app.services.email_service import RecordingEmailService
+from app.services.user_service import UserService
+from app.services.verification_service import VerificationService
+from app.utils.otp import generate_otp, hash_otp, otp_matches
+from app.utils.phone import normalize_e164
+from app.utils.time import IST
+
+
+class FakeFirebase:
+    def __init__(self) -> None:
+        self.store: dict[tuple[str, str], dict] = {}
+        self.deleted_users: list[str] = []
+        self.created: list[dict] = []
+        self.phone_token_payload = {
+            "uid": "temp-phone-uid",
+            "phone_number": "+919876543210",
+        }
+
+    def set_document(self, collection, document_id, data):
+        self.store[(collection, document_id)] = dict(data)
+        return True
+
+    def get_document(self, collection, document_id):
+        doc = self.store.get((collection, document_id))
+        return dict(doc) if doc is not None else None
+
+    def update_document(self, collection, document_id, data):
+        current = self.store[(collection, document_id)]
+        current.update(data)
+        return True
+
+    def delete_document(self, collection, document_id):
+        self.store.pop((collection, document_id), None)
+        return True
+
+    def query_collection(self, collection, field, operator, value):
+        matches = []
+        for (coll, doc_id), data in self.store.items():
+            if coll == collection and data.get(field) == value:
+                matches.append({"id": doc_id, **data})
+        return matches
+
+    def create_user(self, email, password, display_name=""):
+        self.created.append({"email": email, "password": password, "display_name": display_name})
+        return {"user_id": "new-student-uid", "email": email}
+
+    def delete_user(self, user_id):
+        self.deleted_users.append(user_id)
+        return True
+
+    def verify_id_token(self, token, check_revoked=True):
+        if token == "bad-token":
+            raise ValueError("Invalid ID token")
+        return dict(self.phone_token_payload)
+
+    def get_user_by_email(self, email):
+        return None
+
+
+def _service(now: datetime, otp: str = "123456"):
+    firebase = FakeFirebase()
+    email = RecordingEmailService()
+    users = UserService(firebase=firebase)
+    service = VerificationService(
+        firebase=firebase,
+        user_service=users,
+        email_service=email,
+        now_fn=lambda: now,
+        generate_otp_fn=lambda: otp,
+    )
+    return service, firebase, email
+
+
+def test_generate_otp_is_six_digits():
+    code = generate_otp()
+    assert len(code) == 6
+    assert code.isdigit()
+
+
+def test_otp_hash_is_not_plaintext_and_matches_constant_time():
+    code = "847291"
+    digest = hash_otp(code)
+    assert digest != code
+    assert otp_matches(code, digest) is True
+    assert otp_matches("000000", digest) is False
+    assert otp_matches(code, None) is False
+
+
+def test_normalize_e164_indian_national_number():
+    assert normalize_e164("9876543210") == "+919876543210"
+    assert normalize_e164("+91 98765 43210") == "+919876543210"
+
+
+def test_start_rejects_existing_email():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    firebase.set_document(
+        "users",
+        "u1",
+        {"email": "ada@example.com", "mobile_no": "+911111111111"},
+    )
+    with pytest.raises(ConflictError) as exc:
+        service.start(RegisterStartRequest(email="ada@example.com", mobile_number="+919876543210"))
+    assert exc.value.code == "EMAIL_TAKEN"
+
+
+def test_start_accepts_email_or_mobile_independently():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+
+    email_session = service.start(RegisterStartRequest(email="ada@example.com"))
+    email_doc = firebase.get_document("verification_sessions", email_session)
+    assert email_doc["email"] == "ada@example.com"
+    assert email_doc["phone"] == ""
+
+    phone_session = service.start(RegisterStartRequest(mobile_number="+919876543210"))
+    phone_doc = firebase.get_document("verification_sessions", phone_session)
+    assert phone_doc["phone"] == "+919876543210"
+    assert phone_doc["email"] == ""
+
+
+def test_merge_session_adds_second_identifier_without_resetting_other():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, email = _service(now)
+    session_id = service.start(RegisterStartRequest(email="ada@example.com"))
+    service.send_email_otp(EmailSendOtpRequest(session_id=session_id, email="ada@example.com"))
+    service.verify_email_otp(EmailVerifyOtpRequest(session_id=session_id, code="123456"))
+
+    merged = service.start(
+        RegisterStartRequest(
+            session_id=session_id,
+            email="ada@example.com",
+            mobile_number="+919876543210",
+        )
+    )
+    assert merged == session_id
+    doc = firebase.get_document("verification_sessions", session_id)
+    assert doc["email_verified"] is True
+    assert doc["phone"] == "+919876543210"
+    assert doc["phone_verified"] is False
+
+
+def test_email_otp_expiry_and_invalid_code():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, _, email = _service(now)
+    session_id = service.start(
+        RegisterStartRequest(email="ada@example.com", mobile_number="+919876543210")
+    )
+    service.send_email_otp(EmailSendOtpRequest(session_id=session_id, email="ada@example.com"))
+    assert email.sent_to == ["ada@example.com"]
+    assert email.pop_last_code() == "123456"
+
+    with pytest.raises(BadRequestError) as invalid:
+        service.verify_email_otp(EmailVerifyOtpRequest(session_id=session_id, code="000000"))
+    assert invalid.value.code == "INVALID_CODE"
+
+    service._now = lambda: now + timedelta(minutes=11)
+    with pytest.raises(BadRequestError) as expired:
+        service.verify_email_otp(EmailVerifyOtpRequest(session_id=session_id, code="123456"))
+    assert expired.value.code == "EXPIRED"
+
+
+def test_email_otp_too_many_attempts_invalidates_code():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    session_id = service.start(
+        RegisterStartRequest(email="ada@example.com", mobile_number="+919876543210")
+    )
+    service.send_email_otp(EmailSendOtpRequest(session_id=session_id, email="ada@example.com"))
+    for _ in range(4):
+        with pytest.raises(BadRequestError):
+            service.verify_email_otp(EmailVerifyOtpRequest(session_id=session_id, code="000000"))
+    with pytest.raises(TooManyRequestsError) as exc:
+        service.verify_email_otp(EmailVerifyOtpRequest(session_id=session_id, code="000000"))
+    assert exc.value.code == "TOO_MANY_ATTEMPTS"
+    session = firebase.get_document("verification_sessions", session_id)
+    assert session["email_code_hash"] is None
+
+
+def test_resend_cooldown():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, _, _ = _service(now)
+    session_id = service.start(
+        RegisterStartRequest(email="ada@example.com", mobile_number="+919876543210")
+    )
+    payload = EmailSendOtpRequest(session_id=session_id, email="ada@example.com")
+    service.send_email_otp(payload)
+    with pytest.raises(TooManyRequestsError) as exc:
+        service.send_email_otp(payload)
+    assert exc.value.code == "RESEND_COOLDOWN"
+
+
+def test_verify_then_complete_happy_path():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    session_id = service.start(
+        RegisterStartRequest(email="ada@example.com", mobile_number="+919876543210")
+    )
+    service.send_email_otp(EmailSendOtpRequest(session_id=session_id, email="ada@example.com"))
+    service.verify_email_otp(EmailVerifyOtpRequest(session_id=session_id, code="123456"))
+    service.verify_phone_token(
+        VerifyPhoneTokenRequest(
+            session_id=session_id,
+            firebase_id_token="ok-token-that-is-long-enough",
+            mobile_number="+919876543210",
+        )
+    )
+    assert firebase.deleted_users == ["temp-phone-uid"]
+    firebase.set_document(
+        "universities",
+        "uni-niat",
+        {
+            "name": "NIAT",
+            "location": "Hyderabad",
+            "created_by": "admin",
+            "created_at": "2026-08-18T12:00:00+05:30",
+            "updated_at": "2026-08-18T12:00:00+05:30",
+        },
+    )
+    firebase.set_document(
+        "batches",
+        "batch-2024",
+        {
+            "university_id": "uni-niat",
+            "name": "2024-2028",
+            "created_by": "admin",
+            "created_at": "2026-08-18T12:00:00+05:30",
+            "updated_at": "2026-08-18T12:00:00+05:30",
+        },
+    )
+
+    created = service.complete(
+        RegisterCompleteRequest(
+            session_id=session_id,
+            first_name="Ada",
+            last_name="Lovelace",
+            email="ada@example.com",
+            university_id="uni-niat",
+            batch_id="batch-2024",
+            university_name="ignored-client-text",
+            niat_id="N123",
+            mobile_number="+919876543210",
+            password="secret12",
+        )
+    )
+    assert created["user_id"] == "new-student-uid"
+    user = firebase.get_document("users", "new-student-uid")
+    assert user["email_verified"] is True
+    assert user["phone_verified"] is True
+    assert user["first_name"] == "Ada"
+    assert user["university"] == "NIAT"
+    assert user["university_id"] == "uni-niat"
+    assert user["university_location"] == "Hyderabad"
+    assert user["batch_id"] == "batch-2024"
+    assert user["batch_name"] == "2024-2028"
+    assert user["college_type"] == "NIAT"
+    assert user["niat_id"] == "N123"
+    assert user["college_id"] is None
+    assert user["team_members"] == []
+    assert firebase.get_document("verification_sessions", session_id) is None
+
+
+def test_complete_rejects_unknown_university():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    session_id = service.start(
+        RegisterStartRequest(email="ada@example.com", mobile_number="+919876543210")
+    )
+    firebase.update_document(
+        "verification_sessions",
+        session_id,
+        {"email_verified": True, "phone_verified": True},
+    )
+    with pytest.raises(NotFoundError) as exc:
+        service.complete(
+            RegisterCompleteRequest(
+                session_id=session_id,
+                first_name="Ada",
+                last_name="Lovelace",
+                email="ada@example.com",
+                university_id="missing-uni",
+                batch_id="batch-2024",
+                niat_id="N123",
+                mobile_number="+919876543210",
+                password="secret12",
+            )
+        )
+    assert exc.value.code == "UNKNOWN_UNIVERSITY"
+
+
+def test_complete_rejects_batch_from_another_university():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    session_id = service.start(
+        RegisterStartRequest(email="ada@example.com", mobile_number="+919876543210")
+    )
+    firebase.update_document(
+        "verification_sessions",
+        session_id,
+        {"email_verified": True, "phone_verified": True},
+    )
+    firebase.set_document(
+        "universities",
+        "uni-niat",
+        {"name": "NIAT", "location": "Hyderabad"},
+    )
+    firebase.set_document(
+        "universities",
+        "uni-other",
+        {"name": "Anna University", "location": "Chennai"},
+    )
+    firebase.set_document(
+        "batches",
+        "batch-other",
+        {"university_id": "uni-other", "name": "2024-2028"},
+    )
+
+    with pytest.raises(ConflictError) as exc:
+        service.complete(
+            RegisterCompleteRequest(
+                session_id=session_id,
+                first_name="Ada",
+                last_name="Lovelace",
+                email="ada@example.com",
+                university_id="uni-niat",
+                batch_id="batch-other",
+                niat_id="N123",
+                mobile_number="+919876543210",
+                password="secret12",
+            )
+        )
+    assert exc.value.code == "BATCH_UNIVERSITY_MISMATCH"
+    assert firebase.get_document("users", "new-student-uid") is None
+
+
+def test_complete_rejected_without_both_verifications():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, _, _ = _service(now)
+    session_id = service.start(
+        RegisterStartRequest(email="ada@example.com", mobile_number="+919876543210")
+    )
+    with pytest.raises(ForbiddenError) as exc:
+        service.complete(
+            RegisterCompleteRequest(
+                session_id=session_id,
+                first_name="Ada",
+                last_name="Lovelace",
+                email="ada@example.com",
+                university_id="uni-niat",
+                batch_id="batch-2024",
+                university_name="NIAT",
+                niat_id="N123",
+                mobile_number="+919876543210",
+                password="secret12",
+            )
+        )
+    assert exc.value.code == "NOT_VERIFIED"
+
+
+def test_complete_rejects_swapped_email():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    session_id = service.start(
+        RegisterStartRequest(email="ada@example.com", mobile_number="+919876543210")
+    )
+    firebase.update_document(
+        "verification_sessions",
+        session_id,
+        {"email_verified": True, "phone_verified": True},
+    )
+    with pytest.raises(ForbiddenError) as exc:
+        service.complete(
+            RegisterCompleteRequest(
+                session_id=session_id,
+                first_name="Ada",
+                last_name="Lovelace",
+                email="eve@example.com",
+                university_id="uni-niat",
+                batch_id="batch-2024",
+                university_name="NIAT",
+                niat_id="N123",
+                mobile_number="+919876543210",
+                password="secret12",
+            )
+        )
+    assert exc.value.code == "IDENTIFIER_MISMATCH"
+
+
+def test_shared_ip_allows_many_different_emails():
+    """Campus NAT: many students, one public IP — must not hit RATE_LIMITED."""
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, _, email = _service(now)
+    shared_ip = "203.0.113.10"
+    for index in range(8):
+        address = f"student{index}@example.com"
+        phone = f"+91987654000{index}"
+        session_id = service.start(RegisterStartRequest(email=address, mobile_number=phone))
+        service.send_email_otp(
+            EmailSendOtpRequest(session_id=session_id, email=address),
+            client_ip=shared_ip,
+        )
+    assert email.sent_to == [f"student{i}@example.com" for i in range(8)]
+
+
+def test_same_email_still_limited_to_five_sends_per_hour():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    current = {"t": now}
+    service, _, _ = _service(now)
+    service._now = lambda: current["t"]
+    session_id = service.start(
+        RegisterStartRequest(email="ada@example.com", mobile_number="+919876543210")
+    )
+    payload = EmailSendOtpRequest(session_id=session_id, email="ada@example.com")
+    for _ in range(5):
+        service.send_email_otp(payload, client_ip="203.0.113.10")
+        current["t"] = current["t"] + timedelta(minutes=2)
+    with pytest.raises(TooManyRequestsError) as exc:
+        service.send_email_otp(payload, client_ip="203.0.113.10")
+    assert exc.value.code == "RATE_LIMITED"
+
+
+def _verified_session(
+    service,
+    firebase,
+    email="ada@example.com",
+    mobile="+919876543210",
+):
+    session_id = service.start(RegisterStartRequest(email=email, mobile_number=mobile))
+    firebase.update_document(
+        "verification_sessions",
+        session_id,
+        {"email_verified": True, "phone_verified": True},
+    )
+    return session_id
+
+
+def test_non_niat_university_stores_college_id_and_type():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    session_id = _verified_session(service, firebase)
+    firebase.set_document(
+        "universities",
+        "uni-other",
+        {"name": "Other University", "location": "All location", "college_type": "Non NIAT"},
+    )
+    firebase.set_document(
+        "batches",
+        "batch-other",
+        {"university_id": "uni-other", "name": "2024-2028"},
+    )
+
+    service.complete(
+        RegisterCompleteRequest(
+            session_id=session_id,
+            first_name="Ada",
+            last_name="Lovelace",
+            email="ada@example.com",
+            university_id="uni-other",
+            batch_id="batch-other",
+            college_id="C-2048",
+            mobile_number="+919876543210",
+            password="secret12",
+        )
+    )
+    user = firebase.get_document("users", "new-student-uid")
+    assert user["college_type"] == "Non NIAT"
+    assert user["college_id"] == "C-2048"
+    assert user["niat_id"] is None
+
+
+def test_non_niat_registration_requires_college_id():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    session_id = _verified_session(service, firebase)
+    firebase.set_document(
+        "universities",
+        "uni-other",
+        {"name": "Other University", "location": "All location", "college_type": "Non NIAT"},
+    )
+    firebase.set_document(
+        "batches",
+        "batch-other",
+        {"university_id": "uni-other", "name": "2024-2028"},
+    )
+    with pytest.raises(BadRequestError) as exc:
+        service.complete(
+            RegisterCompleteRequest(
+                session_id=session_id,
+                first_name="Ada",
+                last_name="Lovelace",
+                email="ada@example.com",
+                university_id="uni-other",
+                batch_id="batch-other",
+                niat_id="N123",
+                mobile_number="+919876543210",
+                password="secret12",
+            )
+        )
+    assert exc.value.code == "COLLEGE_ID_REQUIRED"
+
+
+def test_college_id_is_unique_only_within_the_university():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    firebase.set_document(
+        "universities",
+        "uni-other",
+        {"name": "Other University", "location": "All location", "college_type": "Non NIAT"},
+    )
+    firebase.set_document(
+        "universities",
+        "uni-anna",
+        {"name": "Anna University", "location": "Chennai", "college_type": "Non NIAT"},
+    )
+    firebase.set_document(
+        "batches",
+        "batch-other",
+        {"university_id": "uni-other", "name": "2024-2028"},
+    )
+    firebase.set_document(
+        "users",
+        "existing",
+        {"college_id": "C-2048", "university_id": "uni-anna", "role": "student"},
+    )
+    session_id = _verified_session(service, firebase)
+    service.complete(
+        RegisterCompleteRequest(
+            session_id=session_id,
+            first_name="Ada",
+            last_name="Lovelace",
+            email="ada@example.com",
+            university_id="uni-other",
+            batch_id="batch-other",
+            college_id="C-2048",
+            mobile_number="+919876543210",
+            password="secret12",
+        )
+    )
+
+    taken = _verified_session(
+        service,
+        firebase,
+        email="grace@example.com",
+        mobile="+919876543211",
+    )
+    with pytest.raises(ConflictError) as exc:
+        service.complete(
+            RegisterCompleteRequest(
+                session_id=taken,
+                first_name="Grace",
+                last_name="Hopper",
+                email="grace@example.com",
+                university_id="uni-other",
+                batch_id="batch-other",
+                college_id="C-2048",
+                mobile_number="+919876543211",
+                password="secret12",
+            )
+        )
+    assert exc.value.code == "COLLEGE_ID_TAKEN"
+
+
+def test_niat_university_still_requires_niat_id():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    session_id = _verified_session(service, firebase)
+    firebase.set_document(
+        "universities",
+        "uni-niat",
+        {"name": "NIAT", "location": "Hyderabad"},
+    )
+    firebase.set_document(
+        "batches",
+        "batch-2024",
+        {"university_id": "uni-niat", "name": "2024-2028"},
+    )
+    with pytest.raises(BadRequestError) as exc:
+        service.complete(
+            RegisterCompleteRequest(
+                session_id=session_id,
+                first_name="Ada",
+                last_name="Lovelace",
+                email="ada@example.com",
+                university_id="uni-niat",
+                batch_id="batch-2024",
+                college_id="C-1",
+                mobile_number="+919876543210",
+                password="secret12",
+            )
+        )
+    assert exc.value.code == "NIAT_ID_REQUIRED"
+
+
+def test_low_ip_cap_still_blocks_when_configured(monkeypatch):
+    monkeypatch.setenv("OTP_MAX_SENDS_PER_IP_PER_HOUR", "2")
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, _, _ = _service(now)
+    shared_ip = "203.0.113.10"
+    for index in range(2):
+        address = f"user{index}@example.com"
+        session_id = service.start(
+            RegisterStartRequest(email=address, mobile_number=f"+91987654100{index}")
+        )
+        service.send_email_otp(
+            EmailSendOtpRequest(session_id=session_id, email=address),
+            client_ip=shared_ip,
+        )
+    session_id = service.start(
+        RegisterStartRequest(email="user2@example.com", mobile_number="+919876541002")
+    )
+    with pytest.raises(TooManyRequestsError) as exc:
+        service.send_email_otp(
+            EmailSendOtpRequest(session_id=session_id, email="user2@example.com"),
+            client_ip=shared_ip,
+        )
+    assert exc.value.code == "RATE_LIMITED"
+
+
+def _niat_catalogue(firebase):
+    firebase.set_document(
+        "universities",
+        "uni-niat",
+        {"name": "NIAT", "location": "Hyderabad", "college_type": "NIAT"},
+    )
+    firebase.set_document(
+        "batches",
+        "batch-2024",
+        {"university_id": "uni-niat", "name": "2024-2028"},
+    )
+
+
+def test_complete_skips_otp_when_both_channels_are_off():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    firebase.set_document(
+        "app_settings",
+        "registration",
+        {"email_verification_enabled": False, "mobile_verification_enabled": False},
+    )
+    session_id = service.start(
+        RegisterStartRequest(email="ada@example.com", mobile_number="+919876543210")
+    )
+    _niat_catalogue(firebase)
+    service.complete(
+        RegisterCompleteRequest(
+            session_id=session_id,
+            first_name="Ada",
+            last_name="Lovelace",
+            email="ada@example.com",
+            university_id="uni-niat",
+            batch_id="batch-2024",
+            niat_id="N123",
+            mobile_number="+919876543210",
+            password="secret12",
+        )
+    )
+    user = firebase.get_document("users", "new-student-uid")
+    assert user["email_verified"] is False
+    assert user["phone_verified"] is False
+    assert user["verification_required"] is False
+
+
+def test_complete_still_requires_the_channel_left_on():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    firebase.set_document(
+        "app_settings",
+        "registration",
+        {"email_verification_enabled": True, "mobile_verification_enabled": False},
+    )
+    session_id = service.start(
+        RegisterStartRequest(email="ada@example.com", mobile_number="+919876543210")
+    )
+    _niat_catalogue(firebase)
+    with pytest.raises(ForbiddenError) as exc:
+        service.complete(
+            RegisterCompleteRequest(
+                session_id=session_id,
+                first_name="Ada",
+                last_name="Lovelace",
+                email="ada@example.com",
+                university_id="uni-niat",
+                batch_id="batch-2024",
+                niat_id="N123",
+                mobile_number="+919876543210",
+                password="secret12",
+            )
+        )
+    assert exc.value.code == "NOT_VERIFIED"

@@ -1,0 +1,162 @@
+# Environment-specific values are Cloud Build substitutions (override per trigger).
+# Production GCP (master): defaults below.
+# Staging GCP (dev-feature): override in the trigger — see README "Multi-environment deploy".
+substitutions:
+  _ALLOWED_ORIGINS: 'https://challazo.nxtlab.tech'
+  _GCS_CORS_ORIGINS: 'https://challazo.nxtlab.tech,http://localhost:3000,http://localhost:5173'
+  _ENVIRONMENT: 'production'
+  _SEED_ON_STARTUP: 'false'
+  # Brevo SMTP (non-secret). SMTP_USERNAME + SMTP_PASSWORD come from Secret Manager.
+  _SMTP_HOST: 'smtp-relay.brevo.com'
+  _SMTP_PORT: '587'
+  _SMTP_FROM: 'noreply@mail.challazo.nxtlab.tech'
+  _GITHUB_AI_EVALUATION_URL: 'https://github-analyser-361821886421.us-central1.run.app'
+  _GITHUB_AI_EVALUATION_WAIT_SECONDS: '120'
+  _GITHUB_AI_EVALUATION_TIMEOUT_SECONDS: '130'
+  # Email OTP: high per-IP cap so campus NAT can register; per-email stays 5/hour.
+  _OTP_MAX_SENDS_PER_IP_PER_HOUR: '2000'
+  _OTP_MAX_SENDS_PER_EMAIL_PER_HOUR: '5'
+
+steps:
+  # Step 1: Ensure Artifact Registry repository exists (required before first push)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - '-c'
+      - 'gcloud artifacts repositories describe ai-hackathon-evaluator-backend --location=asia-south1 || gcloud artifacts repositories create ai-hackathon-evaluator-backend --repository-format=docker --location=asia-south1 --description="Docker repository for AI Hackathon Evaluator Backend"'
+
+  # Step 2: Build Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/ai-hackathon-evaluator-backend/ai-hackathon-evaluator-backend:$SHORT_SHA'
+      - '-t'
+      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/ai-hackathon-evaluator-backend/ai-hackathon-evaluator-backend:latest'
+      - '.'
+
+  # Step 3: Push image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/ai-hackathon-evaluator-backend/ai-hackathon-evaluator-backend:$SHORT_SHA'
+
+  # Step 4: Ensure submission-video bucket exists (+ CORS for browser PUT uploads)
+  # Prefer asia-south1 to colocate with Cloud Run (Phase 8).
+  #
+  # Existing buckets keep their location (GCS locations are immutable). If the
+  # bucket is still in us-central1, deploy continues with a WARNING — copy data
+  # once using the runbook below, then recreate colocated or switch bucket name.
+  #
+  # --- One-time GCS region migration runbook (ops) ---
+  # Option A — same bucket name (brief downtime):
+  #   1) gcloud storage buckets create gs://$PROJECT_ID-hackathon-evaluations-tmp \
+  #        --location=asia-south1 --uniform-bucket-level-access
+  #   2) gcloud storage cp -r gs://$PROJECT_ID-hackathon-evaluations/* \
+  #        gs://$PROJECT_ID-hackathon-evaluations-tmp/
+  #   3) Delete the old us-central1 bucket (only after verifying copy)
+  #   4) Recreate gs://$PROJECT_ID-hackathon-evaluations --location=asia-south1
+  #   5) Copy tmp → new bucket; delete tmp; re-apply CORS (this step)
+  # Option B — new name (zero rewrite of Cloud Build env until cutover):
+  #   1) Create gs://$PROJECT_ID-hackathon-evaluations-as1 in asia-south1
+  #   2) Copy objects; update EVALUATION_BUCKET_NAME on Cloud Run
+  #   3) Rewrite Firestore video_path / banner_path prefixes OR dual-read period
+  # Note: bash vars must use $$ so Cloud Build does not treat them as substitutions.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    env:
+      - 'GCS_CORS_ORIGINS=${_GCS_CORS_ORIGINS}'
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+        BUCKET=gs://$PROJECT_ID-hackathon-evaluations
+        DESIRED_LOCATION=asia-south1
+        if gcloud storage buckets describe "$$BUCKET" >/dev/null 2>&1; then
+          CURRENT_LOCATION=$$(gcloud storage buckets describe "$$BUCKET" --format='value(location)' | tr '[:upper:]' '[:lower:]')
+          if [ "$$CURRENT_LOCATION" != "$$DESIRED_LOCATION" ]; then
+            echo "WARNING: $$BUCKET is in $$CURRENT_LOCATION (want $$DESIRED_LOCATION)."
+            echo "Keeping existing bucket so current video URLs keep working."
+            echo "See Phase 8 migration runbook comments above this Cloud Build step."
+          else
+            echo "Bucket $$BUCKET already in $$DESIRED_LOCATION"
+          fi
+        else
+          gcloud storage buckets create "$$BUCKET" \
+            --location="$$DESIRED_LOCATION" \
+            --uniform-bucket-level-access
+          echo "Created $$BUCKET in $$DESIRED_LOCATION"
+        fi
+        python3 -c "
+        import json, os
+        origins = [o.strip() for o in os.environ['GCS_CORS_ORIGINS'].split(',') if o.strip()]
+        cors = [{
+            'origin': origins,
+            'method': ['GET', 'PUT', 'HEAD', 'OPTIONS'],
+            'responseHeader': ['Content-Type', 'Content-Length', 'x-goog-resumable'],
+            'maxAgeSeconds': 3600,
+        }]
+        with open('/tmp/cors.json', 'w') as f:
+            json.dump(cors, f)
+        "
+        gcloud storage buckets update "$$BUCKET" --cors-file=/tmp/cors.json
+
+  # Step 5: Cloud Tasks queue for durable AI evaluation (Phase 2)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        gcloud tasks queues describe evaluation-jobs --location=asia-south1 \
+          || gcloud tasks queues create evaluation-jobs --location=asia-south1
+
+  # Step 6: Deploy to Cloud Run, then set Cloud Tasks target URL to this revision's URL
+  # Prerequisite: Secret Manager secrets must exist (see README):
+  #   FIREBASE_*, INTERNAL_JOB_SECRET, SMTP_USERNAME, SMTP_PASSWORD (Brevo).
+  #   Set SMTP_USERNAME secret to noreply@mail.nxtlab.tech; SMTP_FROM via _SMTP_FROM below.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+        gcloud run deploy ai-hackathon-evaluator-backend \
+          --image=asia-south1-docker.pkg.dev/$PROJECT_ID/ai-hackathon-evaluator-backend/ai-hackathon-evaluator-backend:$SHORT_SHA \
+          --region=asia-south1 \
+          --allow-unauthenticated \
+          --update-secrets=FIREBASE_PROJECT_ID=FIREBASE_PROJECT_ID:latest,FIREBASE_PRIVATE_KEY=FIREBASE_PRIVATE_KEY:latest,FIREBASE_CLIENT_EMAIL=FIREBASE_CLIENT_EMAIL:latest,FIREBASE_WEB_API_KEY=FIREBASE_WEB_API_KEY:latest,INTERNAL_JOB_SECRET=INTERNAL_JOB_SECRET:latest,SMTP_USERNAME=SMTP_USERNAME:latest,SMTP_PASSWORD=SMTP_PASSWORD:latest \
+          --set-env-vars=ENVIRONMENT=${_ENVIRONMENT},DEBUG=false,EMAIL_PROVIDER=smtp,SMTP_HOST=${_SMTP_HOST},SMTP_PORT=${_SMTP_PORT},SMTP_FROM=${_SMTP_FROM},SMTP_FROM_NAME=Challazo,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=global,EVALUATION_BUCKET_NAME=$PROJECT_ID-hackathon-evaluations,GEMINI_MODEL=gemini-3.5-flash,GEMINI_ENTERPRISE=true,COOKIE_SAMESITE=none,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS},EVALUATION_JOB_MODE=cloud_tasks,CLOUD_TASKS_LOCATION=asia-south1,CLOUD_TASKS_QUEUE=evaluation-jobs,CSRF_PROTECTION=true,REQUIRE_CURRENT_PASSWORD_ON_CHANGE=true,SEED_ON_STARTUP=${_SEED_ON_STARTUP},GITHUB_AI_EVALUATION_URL=${_GITHUB_AI_EVALUATION_URL},GITHUB_AI_EVALUATION_WAIT_SECONDS=${_GITHUB_AI_EVALUATION_WAIT_SECONDS},GITHUB_AI_EVALUATION_TIMEOUT_SECONDS=${_GITHUB_AI_EVALUATION_TIMEOUT_SECONDS},OTP_MAX_SENDS_PER_IP_PER_HOUR=${_OTP_MAX_SENDS_PER_IP_PER_HOUR},OTP_MAX_SENDS_PER_EMAIL_PER_HOUR=${_OTP_MAX_SENDS_PER_EMAIL_PER_HOUR} \
+          --memory=1Gi \
+          --cpu=1 \
+          --timeout=3600
+
+        SERVICE_URL=$$(gcloud run services describe ai-hackathon-evaluator-backend \
+          --region=asia-south1 --format='value(status.url)')
+        gcloud run services update ai-hackathon-evaluator-backend \
+          --region=asia-south1 \
+          --update-env-vars=CLOUD_TASKS_TARGET_URL=$${SERVICE_URL}/internal/jobs/evaluate-submission
+
+        # Allow the Cloud Run runtime SA to enqueue tasks
+        PROJECT_NUMBER=$$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')
+        RUNTIME_SA=$${PROJECT_NUMBER}-compute@developer.gserviceaccount.com
+        gcloud projects add-iam-policy-binding $PROJECT_ID \
+          --member="serviceAccount:$${RUNTIME_SA}" \
+          --role="roles/cloudtasks.enqueuer" \
+          --condition=None \
+          --quiet || true
+    env:
+      - 'CLOUDSDK_COMPUTE_REGION=asia-south1'
+
+images:
+  - 'asia-south1-docker.pkg.dev/$PROJECT_ID/ai-hackathon-evaluator-backend/ai-hackathon-evaluator-backend:$SHORT_SHA'
+  - 'asia-south1-docker.pkg.dev/$PROJECT_ID/ai-hackathon-evaluator-backend/ai-hackathon-evaluator-backend:latest'
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  # Fix for the build error - use Cloud Logging only
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: '1800s'
+
+# Note: For production, consider using Secret Manager for sensitive values instead of substitutions.
+# See: https://cloud.google.com/build/docs/securing-builds/use-secrets

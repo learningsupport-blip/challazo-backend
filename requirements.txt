@@ -1,0 +1,24 @@
+# FastAPI Dependencies
+fastapi>=0.115.0,<1.0.0
+uvicorn[standard]==0.24.0
+pydantic>=2.9.0,<3.0.0
+
+# Firebase (auth + Firestore)
+firebase-admin==6.2.0
+
+# Google Cloud / Vertex AI (Gemini video analysis + GCS + durable jobs)
+google-cloud-storage>=2.19.0
+google-cloud-tasks>=2.16.0,<3.0.0
+google-genai>=1.52.0,<3.0.0
+
+# Configuration
+python-dotenv==1.0.0
+
+# Multipart upload
+python-multipart>=0.0.9
+
+# Email validation
+email-validator>=2.2.0,<3.0.0
+
+# HTTP client
+requests==2.31.0

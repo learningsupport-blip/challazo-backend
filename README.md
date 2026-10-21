@@ -390,7 +390,7 @@ Cloud Build substitutions (override per trigger):
 |---|---|
 | `_SERVICE_NAME` | `challazo-backend` |
 | `_AR_REPO` | `challazo-backend` |
-| `_ALLOWED_ORIGINS` | `https://challazo.nxtlab.tech`, plus localhost 3000 and 5173 |
+| `_ALLOWED_ORIGINS` | `https://challazo.in`, plus localhost 3000 and 5173 |
 | `_GCS_CORS_ORIGINS` | same list as `_ALLOWED_ORIGINS` |
 | `_ENVIRONMENT` | `production` |
 | `_SEED_ON_STARTUP` | `false` |

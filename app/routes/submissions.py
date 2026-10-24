@@ -1119,9 +1119,10 @@ async def assign_submission_evaluator(
     Used by the per-row Evaluator dropdown on the admin Submissions table.
     Pass ``evaluator_id: null`` to unassign.
 
-    ``reason`` is required when an evaluator is already assigned (reassign or
-    unassign). A missing or blank reason returns 400 ``REASON_REQUIRED``.
-    The first assignment does not need one. Every change is appended to
+    ``reason`` is required only when replacing one evaluator with another.
+    Choosing Unassigned, or the first assignment, does not need one. A missing
+    or blank reason on a person-to-person change returns 400 ``REASON_REQUIRED``.
+    Every change is appended to
     ``assignment_history`` and is not rewritten later.
 
     When the submission's round has auto AI on, analysis is queued only if it

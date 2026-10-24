@@ -49,7 +49,11 @@ def _user(user_id, *, created_at, email_verified=False, phone_verified=False, ro
 
 def test_missing_config_keeps_both_channels_on():
     service = AppSettingsService(firebase=FakeFirebase())
+    both = {"email_verification_enabled": True, "mobile_verification_enabled": True}
     assert service.get_registration_config() == {
+        "student": both,
+        "evaluator": both,
+        "application_access": both,
         "email_verification_enabled": True,
         "mobile_verification_enabled": True,
     }
@@ -75,7 +79,13 @@ def test_release_asks_the_oldest_waiting_accounts():
     firebase.set_document(
         "users",
         "staff",
-        _user("staff", created_at="2026-07-01T00:00:00+05:30", role="admin"),
+        _user(
+            "staff",
+            created_at="2026-07-01T00:00:00+05:30",
+            role="admin",
+            email_verified=True,
+            phone_verified=True,
+        ),
     )
     firebase.set_document(
         "users",
@@ -116,6 +126,63 @@ def test_release_refuses_when_both_channels_are_off():
         assert "Turn email or mobile verification on" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_each_role_uses_its_own_channels():
+    firebase = FakeFirebase()
+    firebase.set_document(
+        "app_settings",
+        "registration",
+        {
+            "student": {
+                "email_verification_enabled": True,
+                "mobile_verification_enabled": False,
+            },
+            "evaluator": {
+                "email_verification_enabled": False,
+                "mobile_verification_enabled": True,
+            },
+            "application_access": {
+                "email_verification_enabled": True,
+                "mobile_verification_enabled": True,
+            },
+        },
+    )
+    firebase.set_document(
+        "users", "student", _user("student", created_at="2026-08-03T00:00:00+05:30")
+    )
+    firebase.set_document(
+        "users",
+        "evaluator",
+        _user("evaluator", created_at="2026-08-02T00:00:00+05:30", role="evaluator"),
+    )
+    firebase.set_document(
+        "users",
+        "custom",
+        _user("custom", created_at="2026-08-01T00:00:00+05:30", role="custom"),
+    )
+    service = AppSettingsService(firebase=firebase)
+    status = service.registration_status()
+    assert status["pending_count"] == 3
+    assert status["student"]["mobile_verification_enabled"] is False
+    assert status["evaluator"]["email_verification_enabled"] is False
+
+    released_student = {
+        "role": "student",
+        "email_verified": False,
+        "phone_verified": False,
+        "verification_required": True,
+    }
+    released_evaluator = {**released_student, "role": "evaluator"}
+    released_admin = {**released_student, "role": "admin"}
+    config = service.get_registration_config()
+    assert verification_due_for(released_student, config) == {"email": True, "mobile": False}
+    assert verification_due_for(released_evaluator, config) == {"email": False, "mobile": True}
+    assert verification_due_for(released_admin, config) == {"email": True, "mobile": True}
+    assert verification_due_for({**released_student, "role": "super_admin"}, config) == {
+        "email": False,
+        "mobile": False,
+    }
 
 
 def test_login_due_only_after_release_and_only_for_open_channels():

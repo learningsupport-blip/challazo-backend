@@ -22,7 +22,7 @@ Students enroll in a published hackathon round (solo or team), submit a demo (vi
 | Long jobs | Cloud Tasks → `POST /internal/jobs/evaluate-submission` (local: FastAPI `BackgroundTasks`) |
 | Timezone | Asia/Kolkata (IST) for dates, windows, and timestamps |
 
-There is **no Postgres**. Firestore is the system of record. Analysis does not use a separate job worker process — Cloud Tasks HTTP-POSTs back into **this** service.
+There is **no Postgres**. Firestore is the system of record. Cloud Tasks delivers AI evaluation to the `challazo-evaluator` Cloud Run service (same image, up to four instances). The public API only enqueues that job. Locally, the same `evaluate_submission` path runs inside this process.
 
 ---
 
@@ -405,6 +405,7 @@ sequenceDiagram
   participant API as FastAPI
   participant GCS as GCS
   participant CT as Cloud Tasks
+  participant W as challazo-evaluator
   participant G as Gemini
 
   S->>API: POST /submissions/upload-url
@@ -414,10 +415,10 @@ sequenceDiagram
   API->>API: uniqueness + Firestore submission
   Note over API: Admin assigns evaluator
   API->>CT: enqueue evaluate-submission
-  CT->>API: POST /internal/jobs/evaluate-submission
-  API->>G: gs:// video + rubric / prompts
-  G-->>API: JSON scores + report
-  API->>API: analysis doc + scorecard on submission
+  CT->>W: POST /internal/jobs/evaluate-submission
+  W->>G: gs:// video + rubric / prompts
+  G-->>W: JSON scores + report
+  W->>W: analysis doc + scorecard on submission
 ```
 
 Status on the submission: `uploaded` → `processing` → `completed` | `failed`. The SPA polls `GET /submissions/{id}` (and `/analysis`, `/report` when allowed).
@@ -461,7 +462,7 @@ The SPA never calls the analyser. Manual GitHub scoring still works if the flag 
 | `cloud_tasks` | Explicit, or `auto` when queue + target URL + secret + project are set | Enqueue HTTP task |
 | `background` | Explicit, or `auto` when Cloud Tasks is not configured | FastAPI `BackgroundTasks` |
 
-Worker: `POST /internal/jobs/evaluate-submission` with `X-Internal-Job-Secret`. Non-2xx responses make Cloud Tasks retry (transient Gemini/GCS failures). Invalid secret → 401 (no retry storm of unauthorized tasks if the secret is wrong — Tasks will still retry; keep the secret aligned).
+Worker: `POST /internal/jobs/evaluate-submission` on `challazo-evaluator`, with `X-Internal-Job-Secret`. The queue runs at most four of these at once. Non-2xx responses make Cloud Tasks retry (transient Gemini/GCS failures). Invalid secret → 401 (no retry storm of unauthorized tasks if the secret is wrong — Tasks will still retry; keep the secret aligned).
 
 GitHub AI currently runs as an in-process background task on the evaluate-github-ai request (same 202 + poll pattern), not via Cloud Tasks.
 

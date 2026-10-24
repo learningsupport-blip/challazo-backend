@@ -3,8 +3,8 @@
 substitutions:
   _SERVICE_NAME: 'challazo-backend'
   _AR_REPO: 'challazo-backend'
-  _ALLOWED_ORIGINS: 'https://challazo.in'
-  _GCS_CORS_ORIGINS: 'https://challazo.in'
+  _ALLOWED_ORIGINS: 'https://challazo.in,https://www.challazo.in,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173'
+  _GCS_CORS_ORIGINS: 'https://challazo.in,https://www.challazo.in,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173'
   _ENVIRONMENT: 'production'
   _SEED_ON_STARTUP: 'false'
   # Brevo SMTP (non-secret). SMTP_USERNAME + SMTP_PASSWORD come from Secret Manager.

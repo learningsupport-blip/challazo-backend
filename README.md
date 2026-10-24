@@ -266,7 +266,7 @@ Leaderboard rank uses `final_score` on submissions whose `review_status` is `app
 | `POST` | `/submissions/{id}/approve-evaluation` | admin | Approve score |
 | `POST` | `/submissions/{id}/request-changes` | admin | Send back |
 | `POST` | `/submissions/{id}/publish` | admin | Show report to the student |
-| `POST` | `/submissions/{id}/assign` | admin | Assign or reassign; reassign requires a reason |
+| `POST` | `/submissions/{id}/assign` | admin | Assign, reassign, or unassign. A remark is required only when one evaluator replaces another |
 | `GET` | `/submissions/assigned-to-me` | evaluator | Flat assigned list |
 | `GET` | `/submissions/evaluator/hackathons` | evaluator | Hackathons that have their work |
 | `GET` | `/submissions/evaluator/hackathons/{id}` | evaluator | Their rows for one hackathon |

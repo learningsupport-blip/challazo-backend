@@ -110,7 +110,7 @@ def test_reassign_after_a_score_keeps_history_and_the_score(service: SubmissionS
     assert "final_score" not in service.firebase.txn_update.call_args[0][3]
 
 
-def test_unassign_requires_a_reason(service: SubmissionService):
+def test_unassign_needs_no_reason(service: SubmissionService):
     base = make_submission_doc(
         assigned_evaluator_id="e1",
         review_status="changes_requested",
@@ -122,7 +122,6 @@ def test_unassign_requires_a_reason(service: SubmissionService):
         None,
         assigned_by="sa",
         assigned_by_name="Debashis Nayak",
-        reason="Evaluator left the hackathon",
     )
 
     entry = result["assignment_history"][-1]
@@ -131,7 +130,7 @@ def test_unassign_requires_a_reason(service: SubmissionService):
     assert entry["to_evaluator_id"] is None
     assert entry["to_evaluator_name"] is None
     assert entry["evaluation_submitted"] is True
-    assert entry["reason"] == "Evaluator left the hackathon"
+    assert entry["reason"] is None
 
 
 def test_picking_the_same_evaluator_does_not_append_history(service: SubmissionService):

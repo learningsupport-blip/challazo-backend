@@ -164,6 +164,12 @@ class EvaluationJobService:
         from google.cloud import tasks_v2
         from google.protobuf import duration_pb2
 
+        url = (self.target_url or os.getenv("CLOUD_TASKS_TARGET_URL") or "").strip()
+        if not url:
+            raise RuntimeError(
+                "CLOUD_TASKS_TARGET_URL is not set, so the evaluation job cannot be queued."
+            )
+
         client = tasks_v2.CloudTasksClient()
         parent = client.queue_path(self.project, self.location, self.queue)
 
@@ -184,7 +190,7 @@ class EvaluationJobService:
             "name": f"{parent}/tasks/{task_id}",
             "http_request": {
                 "http_method": tasks_v2.HttpMethod.POST,
-                "url": self.target_url,
+                "url": url,
                 "headers": {
                     "Content-Type": "application/json",
                     "X-Internal-Job-Secret": self.job_secret,

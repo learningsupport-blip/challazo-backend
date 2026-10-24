@@ -384,7 +384,7 @@ Brevo (production email): `SMTP_HOST=smtp-relay.brevo.com`, `SMTP_PORT=587`, `SM
 
 A push to the Git branch **`production`** is what the Cloud Build trigger should build. `cloudbuild.yaml` runs in **asia-south1** and deploys Cloud Run service **`challazo-backend`** from Artifact Registry repo `challazo-backend`. The Cloud Run service runs as `challazo-backend-deploy@$PROJECT_ID.iam.gserviceaccount.com`, the same account the build uses. The container listens on port 8080. The service is `--allow-unauthenticated`; authorization is the application cookie and Bearer check. Memory 1 GiB, 1 CPU, timeout 3600s.
 
-`_ALLOWED_ORIGINS` and `_GCS_CORS_ORIGINS` include `http://localhost:3000` and `http://localhost:5173`. When the production hostname changes, keep those localhost origins.
+`_ALLOWED_ORIGINS` and `_GCS_CORS_ORIGINS` include `https://challazo.in`, `https://www.challazo.in`, and local `localhost` / `127.0.0.1` on ports 3000 and 5173. The storage list is what lets the browser PUT a demo video. When the production hostname changes, keep those local origins.
 
 Cloud Build substitutions (override per trigger):
 
@@ -392,7 +392,7 @@ Cloud Build substitutions (override per trigger):
 |---|---|
 | `_SERVICE_NAME` | `challazo-backend` |
 | `_AR_REPO` | `challazo-backend` |
-| `_ALLOWED_ORIGINS` | `https://challazo.in`, plus localhost 3000 and 5173 |
+| `_ALLOWED_ORIGINS` | `https://challazo.in`, `https://www.challazo.in`, localhost and `127.0.0.1` on ports 3000 and 5173 |
 | `_GCS_CORS_ORIGINS` | same list as `_ALLOWED_ORIGINS` |
 | `_ENVIRONMENT` | `production` |
 | `_SEED_ON_STARTUP` | `false` |

@@ -376,9 +376,10 @@ Per **hackathon + round index** (not per hackathon overall):
 - Single (`team_size_mode` `single`, or legacy `max_team_size == 1`): `POST …/enroll/solo`
 - Open (`team_size_mode` `open`): the same solo enroll, or a team of any size. The leader may submit with one or more members.
 - Team: leader `POST …/teams/create` (name + 6-digit join code) → members `POST …/teams/join`
-- `GET …/participation` drives the SPA (`can_submit`, `already_submitted`, `pending_action`, team completeness)
+- `GET …/participation` drives the SPA (`can_submit`, `already_submitted`, `pending_action`, `can_revert`, team completeness)
+- `POST …/enroll/revert` deletes that round's choice and returns participation in the pre-choice state. A solo student, a team member, or a leader who is still alone can call it before anyone on that choice has submitted. A leader who already has teammates gets `409 TEAM_HAS_MEMBERS`. A submission gets `409 ALREADY_SUBMITTED`.
 
-A leftover `role: solo` enrollment on a team round blocks `choose_role` until that enrollment is removed.
+A leftover `role: solo` enrollment on a team round blocks `choose_role` until that enrollment is removed. Revert is how the student removes it.
 
 ### 9.3 Submit once per round
 

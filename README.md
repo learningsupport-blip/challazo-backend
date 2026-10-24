@@ -240,6 +240,7 @@ Leaderboard rank uses `final_score` on submissions whose `review_status` is `app
 |---|---|---|
 | `GET` | `/hackathons/{id}/rounds/{round_index}/participation` | This student's enrollment |
 | `POST` | `/hackathons/{id}/rounds/{round_index}/enroll/solo` | Solo round |
+| `POST` | `/hackathons/{id}/rounds/{round_index}/enroll/revert` | Undo Solo, leader, or member before a submission |
 | `POST` | `/hackathons/{id}/rounds/{round_index}/teams/create` | Create a team; 6-digit join code, 5 minutes |
 | `POST` | `/hackathons/{id}/rounds/{round_index}/teams/join` | Join with that code |
 | `POST` | `/hackathons/{id}/rounds/{round_index}/teams/join-code` | Leader refreshes the code |

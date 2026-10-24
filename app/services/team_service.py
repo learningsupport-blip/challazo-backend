@@ -213,6 +213,14 @@ class TeamService:
             round_status=round_status,
             round_open=round_open,
             enrolled=enrolled,
+            can_revert=self._can_revert(
+                hackathon,
+                round_,
+                role=role,
+                enrolled=enrolled,
+                team=team,
+                submission_count=submission_count,
+            ),
             role=role,
             team=team,
             can_submit=can_submit,
@@ -237,6 +245,35 @@ class TeamService:
                 "This round is not published yet",
                 code="ROUND_NOT_PUBLISHED",
             )
+
+    def _can_revert(
+        self,
+        hackathon: dict[str, Any],
+        round_: dict[str, Any],
+        *,
+        role: str | None,
+        enrolled: bool,
+        team: HackathonTeamResponse | None,
+        submission_count: int,
+    ) -> bool:
+        if not enrolled or submission_count > 0 or role not in ("solo", "leader", "member"):
+            return False
+        if role == "leader" and team is not None and team.member_count > 1:
+            return False
+        if not round_is_published(round_):
+            return False
+        if (
+            window_status(
+                hackathon.get("start_date"),
+                hackathon.get("end_date"),
+                hackathon.get("start_time"),
+                hackathon.get("end_time"),
+                now=self._now(),
+            )
+            == "closed"
+        ):
+            return False
+        return round_student_status(round_, now=self._now()) != "closed"
 
     def _assert_round_accepts_enrollment(self, hackathon: dict[str, Any], round_index: int) -> None:
         round_ = get_timeline_round(hackathon, round_index)
@@ -353,6 +390,76 @@ class TeamService:
                 "role": "solo",
                 "created_at": now,
             },
+        )
+        return self.get_participation(hackathon_id, round_index, user)
+
+    def revert_enrollment(
+        self, hackathon_id: str, round_index: int, user: CurrentUser
+    ) -> HackathonParticipationResponse:
+        """Drop this round's role choice so the student can pick again.
+
+        Solo, a team leader who is still alone, and a team member can all go
+        back. A submission, a closed round, or teammates still on the roster
+        keep the current choice.
+        """
+        hackathon = self._require_hackathon(hackathon_id)
+        self._assert_visible_to_student(hackathon, user)
+        self._resolve_round(hackathon, round_index)
+        self._assert_round_accepts_enrollment(hackathon, round_index)
+        self._assert_student(user)
+        enrollment = self._get_enrollment_doc(hackathon_id, round_index, user.user_id)
+        if not enrollment:
+            raise ConflictError(
+                "You have not chosen a role for this round",
+                code="NOT_ENROLLED",
+            )
+
+        team_id = str(enrollment.get("team_id") or "").strip() or None
+        submissions = list_round_submissions(
+            self.firebase,
+            student_id=user.user_id,
+            hackathon_id=hackathon_id,
+            round_index=round_index,
+            team_id=team_id,
+        )
+        if submissions:
+            raise ConflictError(
+                "You already submitted for this round, so this choice cannot be changed.",
+                code="ALREADY_SUBMITTED",
+            )
+
+        role = enrollment.get("role")
+        if role == "leader" and team_id:
+            team_doc = self.firebase.get_document(TEAMS, team_id) or {}
+            others = [
+                member
+                for member in list(team_doc.get("members") or [])
+                if member.get("user_id") != user.user_id
+            ]
+            if others:
+                raise ConflictError(
+                    "Ask your teammates to go back before you change this choice.",
+                    code="TEAM_HAS_MEMBERS",
+                )
+            self._revoke_team_join_codes(hackathon_id, round_index, team_id)
+            self.firebase.delete_document(TEAMS, team_id)
+        elif role == "member" and team_id:
+            team_doc = self.firebase.get_document(TEAMS, team_id)
+            if team_doc:
+                members = [
+                    member
+                    for member in list(team_doc.get("members") or [])
+                    if member.get("user_id") != user.user_id
+                ]
+                self.firebase.update_document(
+                    TEAMS,
+                    team_id,
+                    {"members": members, "updated_at": now_ist_iso()},
+                )
+
+        self.firebase.delete_document(
+            ENROLLMENTS,
+            self._enrollment_id(hackathon_id, round_index, user.user_id),
         )
         return self.get_participation(hackathon_id, round_index, user)
 

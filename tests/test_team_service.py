@@ -374,3 +374,66 @@ def test_refresh_join_code_revokes_previous():
     join_code_ids = {doc_id for (coll, doc_id) in svc.firebase.store if coll == JOIN_CODES}
     assert join_code_document_id("hack-1", 0, refreshed.code) in join_code_ids
     assert join_code_document_id("hack-1", 0, first.join_code.code) not in join_code_ids
+
+
+def test_solo_choice_can_revert_to_the_role_choice():
+    svc = _service(timeline=[_open_round(title="Round 1", team_size_mode="open")])
+    student = _student("solo-1")
+    enrolled = svc.enroll_solo("hack-1", 0, student)
+    assert enrolled.can_revert is True
+    assert enrolled.pending_action == "ready"
+
+    reverted = svc.revert_enrollment("hack-1", 0, student)
+    assert reverted.enrolled is False
+    assert reverted.role is None
+    assert reverted.can_revert is False
+    assert reverted.pending_action == "choose_role"
+
+    created = svc.create_team("hack-1", 0, student, "Second Thought")
+    assert created.team.leader_id == "solo-1"
+
+
+def test_member_can_leave_and_a_lone_leader_can_revert():
+    svc = _service()
+    leader = _student("leader-1")
+    created = svc.create_team("hack-1", 0, leader, "Alpha Squad")
+    svc.join_team("hack-1", 0, _student("member-1"), created.join_code.code)
+
+    leader_view = svc.get_participation("hack-1", 0, leader)
+    assert leader_view.can_revert is False
+    with pytest.raises(ConflictError) as blocked:
+        svc.revert_enrollment("hack-1", 0, leader)
+    assert blocked.value.code == "TEAM_HAS_MEMBERS"
+
+    member = _student("member-1")
+    assert svc.get_participation("hack-1", 0, member).can_revert is True
+    left = svc.revert_enrollment("hack-1", 0, member)
+    assert left.enrolled is False
+    assert left.pending_action == "choose_role"
+
+    leader_again = svc.get_participation("hack-1", 0, leader)
+    assert leader_again.can_revert is True
+    assert leader_again.team is not None
+    assert leader_again.team.member_count == 1
+
+    back = svc.revert_enrollment("hack-1", 0, leader)
+    assert back.enrolled is False
+    assert back.pending_action == "choose_role"
+    assert not any(coll == "hackathon_teams" for coll, _ in svc.firebase.store)
+    assert not any(coll == JOIN_CODES for coll, _ in svc.firebase.store)
+
+
+def test_revert_refuses_after_a_submission():
+    svc = _service(timeline=[_open_round(title="Round 1", team_size_mode="open")])
+    student = _student("solo-1")
+    svc.enroll_solo("hack-1", 0, student)
+    svc.firebase.set_document(
+        "submissions",
+        "sub-1",
+        {"student_id": "solo-1", "hackathon_id": "hack-1", "round_index": 0},
+    )
+    state = svc.get_participation("hack-1", 0, student)
+    assert state.can_revert is False
+    with pytest.raises(ConflictError) as exc:
+        svc.revert_enrollment("hack-1", 0, student)
+    assert exc.value.code == "ALREADY_SUBMITTED"

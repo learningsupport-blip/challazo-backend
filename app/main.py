@@ -20,6 +20,7 @@ from app.routes import (
     hackathon,
     internal_jobs,
     metric_scoring,
+    performance_analysis,
     settings,
     submissions,
     teams,
@@ -137,6 +138,7 @@ app.include_router(university.router)
 app.include_router(evaluation_requirement.router)
 app.include_router(evaluation_prompt.router)
 app.include_router(metric_scoring.router)
+app.include_router(performance_analysis.router)
 app.include_router(internal_jobs.router)
 
 

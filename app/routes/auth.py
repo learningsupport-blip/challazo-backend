@@ -111,10 +111,11 @@ async def registration_config(
     service: AppSettingsService = Depends(get_app_settings_service),
 ) -> RegistrationConfigResponse:
     """
-    Public flags for the register page.
+    Public flags for register and Application Access profile screens.
 
-    When a channel is false, hide its Verify button. Registration still collects
-    the email and mobile number.
+    Read ``student``, ``evaluator``, or ``application_access``. When a channel
+    is false, hide its Verify button. The form still collects the email and
+    mobile number. The two top-level booleans repeat the student flags.
     """
     config = await run_sync(service.get_registration_config)
     return RegistrationConfigResponse(**config)
@@ -126,7 +127,7 @@ async def start_account_verification(
     verification: VerificationService = Depends(get_verification_service),
 ) -> AccountVerificationStartResponse:
     """
-    Start OTP for a signed-in student or evaluator Super Admin has asked to verify.
+    Start OTP for a signed-in account Super Admin has asked to verify.
 
     ``email_required`` and ``mobile_required`` say which Verify buttons to show.
     """

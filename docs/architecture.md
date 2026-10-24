@@ -137,6 +137,7 @@ Startup (`lifespan`):
 | `evaluation_requirement` | `/evaluation-requirements` | Rubric / form field definitions |
 | `evaluation_prompt` | `/ai-evaluation-prompts` | Gemini prompt templates |
 | `metric_scoring` | `/ai-evaluation-metric-scoring` | Per-field scoring config |
+| `performance_analysis` | `/admin/analysis` | Hackathon and evaluator performance for the Analysis screen |
 | `internal_jobs` | `/internal/jobs` | Cloud Tasks worker (`X-Internal-Job-Secret`) — not the SPA |
 
 Swagger (`/docs`, `/redoc`, `/openapi.json`) is on in development and off in production unless `ENABLE_API_DOCS=true`.
@@ -272,7 +273,7 @@ Student and evaluator share one registration flow (`VerificationService`). Super
    That college id is unique only within the same university
    (`409 COLLEGE_ID_TAKEN`).
 
-`GET /auth/registration-config` is public. The register page hides Verify for a channel that is off, still calls `register/start`, and `register/complete` stores that channel as `email_verified` / `phone_verified: false` with `verification_required: false`. Turning a channel back on does not popup anyone by itself. `POST /super-admin/settings/registration/release` with `{ "batch_size": 20 }` marks the next oldest waiting students and evaluators (`verification_required: true`). It does not send OTP mail. On the next `POST /auth/login` or `GET /auth/me`, `verification_due.email` / `verification_due.mobile` is true only for a released account that still lacks a channel that is on now. The popup calls `POST /auth/verification/start`, the existing OTP routes, then `POST /auth/verification/complete`. Older accounts with a missing verified flag are treated as already verified.
+`GET /auth/registration-config` is public. It returns a checkbox pair for `student`, `evaluator`, and `application_access` (admin and custom accounts). The two top-level booleans repeat the student pair. The register page reads the pair for the role it is creating, hides Verify for a channel that is off, still collects the email and mobile, and `register/complete` stores that channel as `email_verified` / `phone_verified: false` with `verification_required: false`. Application Access first login (`POST /auth/profile/start` then `/profile/complete`) uses the `application_access` pair the same way. Turning a channel back on does not popup anyone by itself. `PUT /super-admin/settings/registration` saves all three pairs. `POST /super-admin/settings/registration/release` with `{ "batch_size": 20 }` marks the next oldest waiting students, evaluators, and Application Access accounts whose role still has a channel on (`verification_required: true`). It does not send OTP mail. On the next `POST /auth/login` or `GET /auth/me`, `verification_due.email` / `verification_due.mobile` is true only for a released account that still lacks a channel that is on for that role. The popup calls `POST /auth/verification/start`, the existing OTP routes, then `POST /auth/verification/complete`. Older accounts with a missing verified flag are treated as already verified. A registration document saved before per-role checkboxes (only the two top-level booleans) still applies those two values to every role until it is saved again.
 
 OTP rate limits (Firestore `otp_rate_limits`): **5 sends/hour per email**, **2000/hour per IP** (campus NAT), 60s resend cooldown. Codes are hashed (SHA-256 + pepper).
 
@@ -390,6 +391,10 @@ Enforced in `app/services/submission/uniqueness.py` on `POST /submissions` and `
 - Super Admin `POST /super-admin/settings/hackathons/{id}/delete` removes that hackathon and every submission, analysis document, video, banner, team, enrollment, and join code stored for it. The body needs the Profile Password and `confirm_name` equal to the hackathon name. Student accounts stay. `GET /super-admin/settings/hackathons` and `GET /super-admin/settings/hackathons/{id}` fill the settings list and the confirm counts.
 
 `GET /submissions/admin/hackathons/{id}?page=1&page_size=10` returns one page of that queue (`items`, `total`, `page`, `page_size`, `round_summary`). Optional filters are `round_index`, `status` (`uploaded` | `processing` | `completed` | `failed`), and `q` (team name, theme name, or submission id). `round_summary` counts every round and ignores status and search. `page_size` is at most 100. Omitting `page` still returns the full JSON array.
+
+### Analysis screen
+
+`GET /admin/analysis/options` lists hackathons and evaluators for the filters. `POST /admin/analysis/hackathons` with `hackathon_ids` (1–12) and `top_n` (1–20, the screen offers 3, 5, and 10) returns campus headcount, batch strength, enrollment, submissions, NIAT counts, and project quality. A score of 82 is `rating_10` 8.2. The average uses the latest round that has an approved score, and ties at the cutoff are included. `POST /admin/analysis/evaluators` returns day-wise assigned versus completed counts and hours from `assigned_at` to `submitted_for_review_at`. Admin and Super Admin can call these. A custom role needs the `analysis` permission.
 
 ### 9.4 Video upload and Gemini evaluation
 

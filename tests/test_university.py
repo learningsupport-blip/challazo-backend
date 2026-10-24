@@ -1,6 +1,7 @@
 """Admin university catalogue and student-register dropdown labels."""
 
 import pytest
+from pydantic import ValidationError
 
 from app.exceptions import ConflictError, NotFoundError
 from app.models.university_model import (
@@ -54,7 +55,7 @@ def test_display_label_is_name_with_location():
 def test_new_university_defaults_to_niat_and_can_be_non_niat():
     service, firebase = _service()
     niat = service.create_university(
-        UniversityCreateRequest(name="NIAT", location="Hyderabad"),
+        UniversityCreateRequest(name="NIAT", location="Hyderabad", total_students=120),
         created_by="admin-1",
     )
     other = service.create_university(
@@ -66,7 +67,9 @@ def test_new_university_defaults_to_niat_and_can_be_non_niat():
         created_by="admin-1",
     )
     assert niat["college_type"] == "NIAT"
+    assert niat["total_students"] == 120
     assert other["college_type"] == "Non NIAT"
+    assert other["total_students"] is None
     stored = firebase.get_document("universities", other["id"])
     assert stored["college_type"] == "Non NIAT"
 
@@ -75,6 +78,7 @@ def test_new_university_defaults_to_niat_and_can_be_non_niat():
         UniversityUpdateRequest(college_type="Non NIAT"),
     )
     assert changed["college_type"] == "Non NIAT"
+    assert changed["total_students"] is None
 
 
 def test_university_without_college_type_is_treated_as_niat():
@@ -98,11 +102,11 @@ def test_university_without_college_type_is_treated_as_niat():
 def test_create_and_list_sorted_by_name():
     service, _ = _service()
     service.create_university(
-        UniversityCreateRequest(name="Osmania University", location="Hyderabad"),
+        UniversityCreateRequest(name="Osmania University", location="Hyderabad", total_students=80),
         created_by="admin-1",
     )
     service.create_university(
-        UniversityCreateRequest(name="Anna University", location="Chennai"),
+        UniversityCreateRequest(name="Anna University", location="Chennai", total_students=90),
         created_by="admin-1",
     )
     listed = service.list_universities()
@@ -114,12 +118,12 @@ def test_create_and_list_sorted_by_name():
 def test_create_rejects_duplicate_name_and_location():
     service, _ = _service()
     service.create_university(
-        UniversityCreateRequest(name="NIAT", location="Hyderabad"),
+        UniversityCreateRequest(name="NIAT", location="Hyderabad", total_students=120),
         created_by="admin-1",
     )
     with pytest.raises(ConflictError) as exc:
         service.create_university(
-            UniversityCreateRequest(name="niat", location="hyderabad"),
+            UniversityCreateRequest(name="niat", location="hyderabad", total_students=120),
             created_by="admin-1",
         )
     assert exc.value.code == "UNIVERSITY_EXISTS"
@@ -128,11 +132,11 @@ def test_create_rejects_duplicate_name_and_location():
 def test_same_name_different_location_is_allowed():
     service, _ = _service()
     first = service.create_university(
-        UniversityCreateRequest(name="NIAT", location="Hyderabad"),
+        UniversityCreateRequest(name="NIAT", location="Hyderabad", total_students=120),
         created_by="admin-1",
     )
     second = service.create_university(
-        UniversityCreateRequest(name="NIAT", location="Bengaluru"),
+        UniversityCreateRequest(name="NIAT", location="Bengaluru", total_students=60),
         created_by="admin-1",
     )
     assert first["id"] != second["id"]
@@ -142,7 +146,7 @@ def test_same_name_different_location_is_allowed():
 def test_update_and_delete():
     service, firebase = _service()
     created = service.create_university(
-        UniversityCreateRequest(name="NIAT", location="Hyderabad"),
+        UniversityCreateRequest(name="NIAT", location="Hyderabad", total_students=120),
         created_by="admin-1",
     )
     updated = service.update_university(
@@ -168,21 +172,21 @@ def test_update_missing_university():
 def test_batches_are_scoped_to_one_university():
     service, _ = _service()
     niat = service.create_university(
-        UniversityCreateRequest(name="NIAT", location="Hyderabad"),
+        UniversityCreateRequest(name="NIAT", location="Hyderabad", total_students=120),
         created_by="admin-1",
     )
     other = service.create_university(
-        UniversityCreateRequest(name="Anna University", location="Chennai"),
+        UniversityCreateRequest(name="Anna University", location="Chennai", total_students=90),
         created_by="admin-1",
     )
     first = service.create_batch(
         niat["id"],
-        BatchCreateRequest(name="2024-2028"),
+        BatchCreateRequest(name="2024-2028", total_students=40),
         created_by="admin-1",
     )
     service.create_batch(
         other["id"],
-        BatchCreateRequest(name="2024-2028"),
+        BatchCreateRequest(name="2024-2028", total_students=40),
         created_by="admin-1",
     )
 
@@ -194,7 +198,7 @@ def test_batches_are_scoped_to_one_university():
     with pytest.raises(ConflictError) as duplicate:
         service.create_batch(
             niat["id"],
-            BatchCreateRequest(name="2024-2028"),
+            BatchCreateRequest(name="2024-2028", total_students=40),
             created_by="admin-1",
         )
     assert duplicate.value.code == "BATCH_EXISTS"
@@ -209,6 +213,13 @@ def test_batches_are_scoped_to_one_university():
         BatchUpdateRequest(name="2025-2029"),
     )
     assert renamed["name"] == "2025-2029"
+    assert renamed["total_students"] == 40
+    strengthened = service.update_batch(
+        niat["id"],
+        first["id"],
+        BatchUpdateRequest(name="2025-2029", total_students=55),
+    )
+    assert strengthened["total_students"] == 55
     assert service.delete_university(niat["id"]) is True
     assert service.get_batch(first["id"]) is None
     assert len(service.list_batches(other["id"])) == 1
@@ -217,7 +228,7 @@ def test_batches_are_scoped_to_one_university():
 def test_require_university():
     service, _ = _service()
     created = service.create_university(
-        UniversityCreateRequest(name="NIAT", location="Hyderabad"),
+        UniversityCreateRequest(name="NIAT", location="Hyderabad", total_students=120),
         created_by="admin-1",
     )
     found = service.require_university(created["id"])
@@ -225,3 +236,40 @@ def test_require_university():
     with pytest.raises(NotFoundError) as exc:
         service.require_university("nope")
     assert exc.value.code == "UNKNOWN_UNIVERSITY"
+
+
+def test_niat_university_requires_total_students_and_non_niat_rejects_it():
+    with pytest.raises(ValidationError):
+        UniversityCreateRequest(name="NIAT", location="Hyderabad")
+    with pytest.raises(ValidationError):
+        UniversityCreateRequest(
+            name="Other",
+            location="City",
+            college_type="Non NIAT",
+            total_students=10,
+        )
+
+    service, _ = _service()
+    created = service.create_university(
+        UniversityCreateRequest(name="NIAT", location="Pune", total_students=200),
+        created_by="admin-1",
+    )
+    switched = service.update_university(
+        created["id"],
+        UniversityUpdateRequest(total_students=250),
+    )
+    assert switched["total_students"] == 250
+
+
+def test_batch_stores_strength():
+    service, _ = _service()
+    university = service.create_university(
+        UniversityCreateRequest(name="NIAT", location="Hyderabad", total_students=120),
+        created_by="admin-1",
+    )
+    batch = service.create_batch(
+        university["id"],
+        BatchCreateRequest(name="2026-2030", total_students=36),
+        created_by="admin-1",
+    )
+    assert batch["total_students"] == 36

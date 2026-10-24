@@ -28,6 +28,7 @@ ASSIGNABLE_PERMISSIONS: tuple[dict[str, str], ...] = (
     {"key": "themes", "label": "Themes", "group": "Administration"},
     {"key": "requirements", "label": "Requirements", "group": "Administration"},
     {"key": "video_analysis", "label": "Video Analysis", "group": "Administration"},
+    {"key": "analysis", "label": "Analysis", "group": "Administration"},
     {
         "key": "student_management",
         "label": "Student Management",
@@ -63,6 +64,7 @@ ALL_PERMISSIONS: tuple[str, ...] = tuple(
 _PATH_PERMISSIONS: tuple[tuple[str, str], ...] = (
     ("/super-admin/settings", "application_settings"),
     ("/admin/overview", "overview"),
+    ("/admin/analysis", "analysis"),
     ("/admin/evaluators", "evaluator_management"),
     ("/admin/users", "student_management"),
     ("/admin/user/", "student_management"),

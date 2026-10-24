@@ -170,7 +170,7 @@ Paths below are the live routers. Request bodies and response fields are the Pyd
 |---|---|---|
 | `GET` | `/health` | Process health and IST server time |
 | `GET` | `/` | Welcome payload |
-| `GET` | `/auth/registration-config` | Whether self-service registration is open |
+| `GET` | `/auth/registration-config` | Per-role email and mobile verification flags |
 | `POST` | `/auth/login` | Session cookie |
 | `GET` | `/auth/csrf` | CSRF token for an existing session |
 | `POST` | `/auth/logout` | Clear the cookie |
@@ -312,6 +312,7 @@ Direct browser upload needs GCS CORS that includes the frontend origin. The buck
 | Prefix | Who | Operations |
 |---|---|---|
 | `/admin/overview` | admin | Counts for the dashboard |
+| `/admin/analysis` | admin | Hackathon and evaluator performance. Custom roles need the Analysis permission |
 | `/admin/users` | admin | Paginated user list |
 | `/admin/user/{user_id}` | admin | Get, patch, delete |
 | `/admin/evaluators` | admin | Approved and all evaluator lists |
@@ -323,7 +324,7 @@ Direct browser upload needs GCS CORS that includes the frontend origin. The buck
 | `/admin/access/users` | super admin | Staff logins: list, create, patch, delete |
 | `/admin/access/logs` | super admin | Activity log, paginated |
 | `/admin/access/observation` | super admin | Observation summary |
-| `/super-admin/settings` | super admin | App settings, profile password, registration open/close, hackathon delete, database reset |
+| `/super-admin/settings` | super admin | App settings, profile password, per-role verification, hackathon delete, database reset |
 
 `POST /super-admin/settings/reset-database` and hackathon delete remove Firestore data for that action. Treat them as production-destructive.
 

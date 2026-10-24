@@ -7,6 +7,7 @@ from typing import Any
 
 from app.exceptions import ConflictError, NotFoundError
 from app.models.university_model import (
+    COLLEGE_TYPE_NIAT,
     BatchCreateRequest,
     BatchUpdateRequest,
     UniversityCreateRequest,
@@ -20,6 +21,15 @@ from app.utils.time import now_ist_iso
 
 
 logger = logging.getLogger(__name__)
+
+
+def _stored_total_students(value: Any) -> int | None:
+    """Headcount already saved on a university or batch. Missing stays unset."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 1:
+        return None
+    return value
 
 
 class UniversityService:
@@ -50,6 +60,8 @@ class UniversityService:
             "created_at": now,
             "updated_at": now,
         }
+        if request.total_students is not None:
+            document["total_students"] = request.total_students
         self.firebase.set_document(self.collection, university_id, document)
         return self._to_item(university_id, document)
 
@@ -96,16 +108,56 @@ class UniversityService:
         )
         self._assert_unique(name, location, exclude_id=university_id)
 
+        college_type = (
+            request.college_type
+            if request.college_type is not None
+            else normalize_college_type(existing.get("college_type"))
+        )
+        total_students = (
+            request.total_students
+            if "total_students" in request.model_fields_set
+            else _stored_total_students(existing.get("total_students"))
+        )
+        if college_type == COLLEGE_TYPE_NIAT and total_students is None:
+            raise ValueError("Total students is required when college type is NIAT")
+        if college_type != COLLEGE_TYPE_NIAT:
+            total_students = None
+
         update: dict[str, Any] = {}
         if request.name is not None:
             update["name"] = name
         if request.location is not None:
             update["location"] = location
         if request.college_type is not None:
-            update["college_type"] = request.college_type
+            update["college_type"] = college_type
+        headcount_changed = total_students != _stored_total_students(existing.get("total_students"))
+        if (
+            "total_students" in request.model_fields_set
+            or request.college_type is not None
+            or headcount_changed
+        ):
+            if total_students is None:
+                update["total_students"] = None
+            else:
+                update["total_students"] = total_students
         if update:
             update["updated_at"] = now_ist_iso()
-            self.firebase.update_document(self.collection, university_id, update)
+            if update.get("total_students") is None and "total_students" in update:
+                stored = {
+                    key: value
+                    for key, value in existing.items()
+                    if key not in ("id", "total_students")
+                }
+                stored.update(
+                    {
+                        key: value
+                        for key, value in update.items()
+                        if key != "total_students"
+                    }
+                )
+                self.firebase.set_document(self.collection, university_id, stored)
+            else:
+                self.firebase.update_document(self.collection, university_id, update)
 
         university = self.get_university(university_id)
         if not university:
@@ -137,6 +189,7 @@ class UniversityService:
         document = {
             "university_id": university["id"],
             "name": name,
+            "total_students": request.total_students,
             "created_by": created_by,
             "created_at": now,
             "updated_at": now,
@@ -212,11 +265,10 @@ class UniversityService:
         self.require_batch_for_university(batch_id, university_id)
         name = request.name.strip()
         self._assert_batch_name_unique(university_id, name, exclude_id=batch_id)
-        self.firebase.update_document(
-            self.batch_collection,
-            batch_id,
-            {"name": name, "updated_at": now_ist_iso()},
-        )
+        update: dict[str, Any] = {"name": name, "updated_at": now_ist_iso()}
+        if request.total_students is not None:
+            update["total_students"] = request.total_students
+        self.firebase.update_document(self.batch_collection, batch_id, update)
         updated = self.get_batch(batch_id)
         if not updated:
             raise NotFoundError("Batch not found", code="UNKNOWN_BATCH")
@@ -281,6 +333,7 @@ class UniversityService:
             "location": location,
             "display_label": university_display_label(name, location),
             "college_type": normalize_college_type(document.get("college_type")),
+            "total_students": _stored_total_students(document.get("total_students")),
             "created_by": document.get("created_by", ""),
             "created_at": document.get("created_at", ""),
             "updated_at": document.get("updated_at", ""),
@@ -298,6 +351,7 @@ class UniversityService:
             "university_id": str(document.get("university_id") or ""),
             "university_name": university_name,
             "name": str(document.get("name") or "").strip(),
+            "total_students": _stored_total_students(document.get("total_students")),
             "created_by": document.get("created_by", ""),
             "created_at": document.get("created_at", ""),
             "updated_at": document.get("updated_at", ""),

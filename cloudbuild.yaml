@@ -110,10 +110,10 @@ steps:
       - |
         gcloud tasks queues describe evaluation-jobs --location=asia-south1 \
           || gcloud tasks queues create evaluation-jobs --location=asia-south1
-        # One video analysis at a time. A burst exhausts the Gemini token quota
-        # and the worker used to store that as a permanent failure.
+        # Four evaluations at a time, matching challazo-evaluator max instances.
+        # A 429 stays retryable; the rest of a larger batch waits in this queue.
         gcloud tasks queues update evaluation-jobs --location=asia-south1 \
-          --max-concurrent-dispatches=1 \
+          --max-concurrent-dispatches=4 \
           --max-dispatches-per-second=1 \
           --min-backoff=120s \
           --max-backoff=3600s
@@ -129,33 +129,60 @@ steps:
       - |
         set -euo pipefail
         RUNTIME_SA="challazo-backend-deploy@$PROJECT_ID.iam.gserviceaccount.com"
-        # --set-env-vars replaces every plain env var. Read the stable service
-        # URL first so this deploy keeps CLOUD_TASKS_TARGET_URL. Without it,
-        # Cloud Tasks rejects the job with "HttpRequest.url is required" and
-        # the submission is marked failed.
-        EXISTING_URL=$$(gcloud run services describe ${_SERVICE_NAME} \
+        EVALUATOR_NAME="challazo-evaluator"
+        IMAGE="asia-south1-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:$SHORT_SHA"
+        SECRETS="FIREBASE_PROJECT_ID=FIREBASE_PROJECT_ID:latest,FIREBASE_PRIVATE_KEY=FIREBASE_PRIVATE_KEY:latest,FIREBASE_CLIENT_EMAIL=FIREBASE_CLIENT_EMAIL:latest,FIREBASE_WEB_API_KEY=FIREBASE_WEB_API_KEY:latest,INTERNAL_JOB_SECRET=INTERNAL_JOB_SECRET:latest,SMTP_USERNAME=SMTP_USERNAME:latest,SMTP_PASSWORD=SMTP_PASSWORD:latest"
+        # Shared plain env. --set-env-vars replaces every plain env var, so both
+        # services get this full list. CLOUD_TASKS_TARGET_URL is appended only
+        # on the API, and only when a worker URL is already known.
+        ENV_VARS="^|^ENVIRONMENT=${_ENVIRONMENT}|DEBUG=false|EMAIL_PROVIDER=smtp|SMTP_HOST=${_SMTP_HOST}|SMTP_PORT=${_SMTP_PORT}|SMTP_FROM=${_SMTP_FROM}|SMTP_FROM_NAME=Challazo|GOOGLE_CLOUD_PROJECT=$PROJECT_ID|GOOGLE_CLOUD_LOCATION=global|EVALUATION_BUCKET_NAME=$PROJECT_ID-hackathon-evaluations|GEMINI_MODEL=gemini-3.5-flash|GEMINI_ENTERPRISE=true|COOKIE_SAMESITE=none|ALLOWED_ORIGINS=${_ALLOWED_ORIGINS}|EVALUATION_JOB_MODE=cloud_tasks|CLOUD_TASKS_LOCATION=asia-south1|CLOUD_TASKS_QUEUE=evaluation-jobs|CSRF_PROTECTION=true|REQUIRE_CURRENT_PASSWORD_ON_CHANGE=true|SEED_ON_STARTUP=${_SEED_ON_STARTUP}|GITHUB_AI_EVALUATION_URL=${_GITHUB_AI_EVALUATION_URL}|GITHUB_AI_EVALUATION_WAIT_SECONDS=${_GITHUB_AI_EVALUATION_WAIT_SECONDS}|GITHUB_AI_EVALUATION_TIMEOUT_SECONDS=${_GITHUB_AI_EVALUATION_TIMEOUT_SECONDS}|OTP_MAX_SENDS_PER_IP_PER_HOUR=${_OTP_MAX_SENDS_PER_IP_PER_HOUR}|OTP_MAX_SENDS_PER_EMAIL_PER_HOUR=${_OTP_MAX_SENDS_PER_EMAIL_PER_HOUR}"
+
+        # Prefer the evaluator URL. On the first split it does not exist yet,
+        # so keep the API worker URL and repoint it after the evaluator deploys.
+        EVALUATOR_URL=$$(gcloud run services describe "$$EVALUATOR_NAME" \
           --region=asia-south1 --format='value(status.url)' 2>/dev/null || true)
-        TARGET_ENV=""
-        if [ -n "$$EXISTING_URL" ]; then
-          TARGET_ENV="|CLOUD_TASKS_TARGET_URL=$${EXISTING_URL}/internal/jobs/evaluate-submission"
+        if [ -z "$$EVALUATOR_URL" ]; then
+          EVALUATOR_URL=$$(gcloud run services describe ${_SERVICE_NAME} \
+            --region=asia-south1 --format='value(status.url)' 2>/dev/null || true)
         fi
+        TARGET_ENV=""
+        if [ -n "$$EVALUATOR_URL" ]; then
+          TARGET_ENV="|CLOUD_TASKS_TARGET_URL=$${EVALUATOR_URL}/internal/jobs/evaluate-submission"
+        fi
+
         gcloud run deploy ${_SERVICE_NAME} \
-          --image=asia-south1-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:$SHORT_SHA \
+          --image="$$IMAGE" \
           --region=asia-south1 \
           --service-account="$$RUNTIME_SA" \
           --allow-unauthenticated \
-          --update-secrets=FIREBASE_PROJECT_ID=FIREBASE_PROJECT_ID:latest,FIREBASE_PRIVATE_KEY=FIREBASE_PRIVATE_KEY:latest,FIREBASE_CLIENT_EMAIL=FIREBASE_CLIENT_EMAIL:latest,FIREBASE_WEB_API_KEY=FIREBASE_WEB_API_KEY:latest,INTERNAL_JOB_SECRET=INTERNAL_JOB_SECRET:latest,SMTP_USERNAME=SMTP_USERNAME:latest,SMTP_PASSWORD=SMTP_PASSWORD:latest \
-          --set-env-vars="^|^ENVIRONMENT=${_ENVIRONMENT}|DEBUG=false|EMAIL_PROVIDER=smtp|SMTP_HOST=${_SMTP_HOST}|SMTP_PORT=${_SMTP_PORT}|SMTP_FROM=${_SMTP_FROM}|SMTP_FROM_NAME=Challazo|GOOGLE_CLOUD_PROJECT=$PROJECT_ID|GOOGLE_CLOUD_LOCATION=global|EVALUATION_BUCKET_NAME=$PROJECT_ID-hackathon-evaluations|GEMINI_MODEL=gemini-3.5-flash|GEMINI_ENTERPRISE=true|COOKIE_SAMESITE=none|ALLOWED_ORIGINS=${_ALLOWED_ORIGINS}|EVALUATION_JOB_MODE=cloud_tasks|CLOUD_TASKS_LOCATION=asia-south1|CLOUD_TASKS_QUEUE=evaluation-jobs|CSRF_PROTECTION=true|REQUIRE_CURRENT_PASSWORD_ON_CHANGE=true|SEED_ON_STARTUP=${_SEED_ON_STARTUP}|GITHUB_AI_EVALUATION_URL=${_GITHUB_AI_EVALUATION_URL}|GITHUB_AI_EVALUATION_WAIT_SECONDS=${_GITHUB_AI_EVALUATION_WAIT_SECONDS}|GITHUB_AI_EVALUATION_TIMEOUT_SECONDS=${_GITHUB_AI_EVALUATION_TIMEOUT_SECONDS}|OTP_MAX_SENDS_PER_IP_PER_HOUR=${_OTP_MAX_SENDS_PER_IP_PER_HOUR}|OTP_MAX_SENDS_PER_EMAIL_PER_HOUR=${_OTP_MAX_SENDS_PER_EMAIL_PER_HOUR}$${TARGET_ENV}" \
+          --update-secrets="$$SECRETS" \
+          --set-env-vars="$${ENV_VARS}$${TARGET_ENV}" \
           --memory=1Gi \
           --cpu=1 \
           --timeout=3600
 
-        SERVICE_URL=$$(gcloud run services describe ${_SERVICE_NAME} \
+        # Same image and account. One request per instance, up to four instances.
+        # The site keeps calling challazo-backend. Cloud Tasks calls this service.
+        gcloud run deploy "$$EVALUATOR_NAME" \
+          --image="$$IMAGE" \
+          --region=asia-south1 \
+          --service-account="$$RUNTIME_SA" \
+          --allow-unauthenticated \
+          --update-secrets="$$SECRETS" \
+          --set-env-vars="$$ENV_VARS" \
+          --memory=1Gi \
+          --cpu=1 \
+          --timeout=3600 \
+          --concurrency=1 \
+          --min-instances=0 \
+          --max-instances=4
+
+        EVALUATOR_URL=$$(gcloud run services describe "$$EVALUATOR_NAME" \
           --region=asia-south1 --format='value(status.url)')
         gcloud run services update ${_SERVICE_NAME} \
           --region=asia-south1 \
           --service-account="$$RUNTIME_SA" \
-          --update-env-vars=CLOUD_TASKS_TARGET_URL=$${SERVICE_URL}/internal/jobs/evaluate-submission
+          --update-env-vars="CLOUD_TASKS_TARGET_URL=$${EVALUATOR_URL}/internal/jobs/evaluate-submission"
 
         # Gemini and Cloud Tasks use this same runtime account.
         for ROLE in roles/cloudtasks.enqueuer roles/aiplatform.user roles/secretmanager.secretAccessor; do

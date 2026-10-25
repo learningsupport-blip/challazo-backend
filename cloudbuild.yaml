@@ -129,7 +129,6 @@ steps:
       - |
         set -euo pipefail
         RUNTIME_SA="challazo-backend-deploy@$PROJECT_ID.iam.gserviceaccount.com"
-        EVALUATOR_NAME="challazo-evaluator"
         IMAGE="asia-south1-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:$SHORT_SHA"
         SECRETS="FIREBASE_PROJECT_ID=FIREBASE_PROJECT_ID:latest,FIREBASE_PRIVATE_KEY=FIREBASE_PRIVATE_KEY:latest,FIREBASE_CLIENT_EMAIL=FIREBASE_CLIENT_EMAIL:latest,FIREBASE_WEB_API_KEY=FIREBASE_WEB_API_KEY:latest,INTERNAL_JOB_SECRET=INTERNAL_JOB_SECRET:latest,SMTP_USERNAME=SMTP_USERNAME:latest,SMTP_PASSWORD=SMTP_PASSWORD:latest"
         # Shared plain env. --set-env-vars replaces every plain env var, so both
@@ -137,17 +136,15 @@ steps:
         # on the API, and only when a worker URL is already known.
         ENV_VARS="^|^ENVIRONMENT=${_ENVIRONMENT}|DEBUG=false|EMAIL_PROVIDER=smtp|SMTP_HOST=${_SMTP_HOST}|SMTP_PORT=${_SMTP_PORT}|SMTP_FROM=${_SMTP_FROM}|SMTP_FROM_NAME=Challazo|GOOGLE_CLOUD_PROJECT=$PROJECT_ID|GOOGLE_CLOUD_LOCATION=global|EVALUATION_BUCKET_NAME=$PROJECT_ID-hackathon-evaluations|GEMINI_MODEL=gemini-3.5-flash|GEMINI_ENTERPRISE=true|COOKIE_SAMESITE=none|ALLOWED_ORIGINS=${_ALLOWED_ORIGINS}|EVALUATION_JOB_MODE=cloud_tasks|CLOUD_TASKS_LOCATION=asia-south1|CLOUD_TASKS_QUEUE=evaluation-jobs|CSRF_PROTECTION=true|REQUIRE_CURRENT_PASSWORD_ON_CHANGE=true|SEED_ON_STARTUP=${_SEED_ON_STARTUP}|GITHUB_AI_EVALUATION_URL=${_GITHUB_AI_EVALUATION_URL}|GITHUB_AI_EVALUATION_WAIT_SECONDS=${_GITHUB_AI_EVALUATION_WAIT_SECONDS}|GITHUB_AI_EVALUATION_TIMEOUT_SECONDS=${_GITHUB_AI_EVALUATION_TIMEOUT_SECONDS}|OTP_MAX_SENDS_PER_IP_PER_HOUR=${_OTP_MAX_SENDS_PER_IP_PER_HOUR}|OTP_MAX_SENDS_PER_EMAIL_PER_HOUR=${_OTP_MAX_SENDS_PER_EMAIL_PER_HOUR}"
 
-        # Prefer the evaluator URL. On the first split it does not exist yet,
-        # so keep the API worker URL and repoint it after the evaluator deploys.
-        EVALUATOR_URL=$$(gcloud run services describe "$$EVALUATOR_NAME" \
-          --region=asia-south1 --format='value(status.url)' 2>/dev/null || true)
-        if [ -z "$$EVALUATOR_URL" ]; then
-          EVALUATOR_URL=$$(gcloud run services describe ${_SERVICE_NAME} \
-            --region=asia-south1 --format='value(status.url)' 2>/dev/null || true)
-        fi
+        # Keep the worker URL already on the API. Evaluation runs in the
+        # Tier 1 project; a later deploy must not point jobs back at this API.
+        CURRENT_TARGET=$$(gcloud run services describe ${_SERVICE_NAME} \
+          --region=asia-south1 \
+          --format='value(spec.template.spec.containers[0].env.filter("name:CLOUD_TASKS_TARGET_URL").extract(value).flatten())' \
+          2>/dev/null || true)
         TARGET_ENV=""
-        if [ -n "$$EVALUATOR_URL" ]; then
-          TARGET_ENV="|CLOUD_TASKS_TARGET_URL=$${EVALUATOR_URL}/internal/jobs/evaluate-submission"
+        if [ -n "$$CURRENT_TARGET" ]; then
+          TARGET_ENV="|CLOUD_TASKS_TARGET_URL=$$CURRENT_TARGET"
         fi
 
         gcloud run deploy ${_SERVICE_NAME} \
@@ -161,29 +158,8 @@ steps:
           --cpu=1 \
           --timeout=3600
 
-        # Same image and account. One request per instance, up to four instances.
-        # The site keeps calling challazo-backend. Cloud Tasks calls this service.
-        gcloud run deploy "$$EVALUATOR_NAME" \
-          --image="$$IMAGE" \
-          --region=asia-south1 \
-          --service-account="$$RUNTIME_SA" \
-          --allow-unauthenticated \
-          --update-secrets="$$SECRETS" \
-          --set-env-vars="$$ENV_VARS" \
-          --memory=1Gi \
-          --cpu=1 \
-          --timeout=3600 \
-          --concurrency=1 \
-          --min-instances=0 \
-          --max-instances=4
-
-        EVALUATOR_URL=$$(gcloud run services describe "$$EVALUATOR_NAME" \
-          --region=asia-south1 --format='value(status.url)')
-        gcloud run services update ${_SERVICE_NAME} \
-          --region=asia-south1 \
-          --service-account="$$RUNTIME_SA" \
-          --update-env-vars="CLOUD_TASKS_TARGET_URL=$${EVALUATOR_URL}/internal/jobs/evaluate-submission"
-
+        # Gemini calls run on challazo-evaluator in the Tier 1 project.
+        # This deploy does not create or change that service.
         # Gemini and Cloud Tasks use this same runtime account.
         for ROLE in roles/cloudtasks.enqueuer roles/aiplatform.user roles/secretmanager.secretAccessor; do
           gcloud projects add-iam-policy-binding $PROJECT_ID \

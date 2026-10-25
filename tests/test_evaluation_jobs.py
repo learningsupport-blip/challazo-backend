@@ -84,6 +84,8 @@ def test_enqueue_cloud_task_refuses_blank_worker_url(monkeypatch):
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "demo-proj")
     monkeypatch.setenv("CLOUD_TASKS_QUEUE", "evaluation-jobs")
     monkeypatch.setenv("CLOUD_TASKS_TARGET_URL", "")
+    monkeypatch.delenv("CLOUD_TASKS_PERSONAL_TARGET_URL", raising=False)
+    monkeypatch.delenv("CLOUD_TASKS_COMPANY_TARGET_URL", raising=False)
     monkeypatch.setenv("INTERNAL_JOB_SECRET", "secret-value")
     jobs = EvaluationJobService()
     with pytest.raises(RuntimeError, match="CLOUD_TASKS_TARGET_URL"):

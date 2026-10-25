@@ -16,6 +16,16 @@ from google.cloud import storage
 
 from app.models.settings_model import RESET_CONFIRM_PHRASE
 from app.services.email_service import MAIL_COLLECTION
+from app.services.evaluation_routing import (
+    COMPANY_KEY,
+    EVALUATION_ROUTING_DOC_ID,
+    PERSONAL_KEY,
+    WORKER_CATALOG,
+    build_sequence,
+    routing_summary,
+    shares_from_document,
+    worker_urls,
+)
 from app.services.firebase import FirebaseService
 from app.services.team_service import TEAMS, ENROLLMENTS, JOIN_CODES
 from app.services.verification_service import RATE_LIMITS, SESSIONS
@@ -195,6 +205,135 @@ class AppSettingsService:
             "wipeable_collections": wipeable,
             "evaluation_bucket_name": bucket,
             "reset_confirm_phrase": RESET_CONFIRM_PHRASE,
+        }
+
+    def get_evaluation_routing(self) -> dict[str, Any]:
+        """Shares for the Application Settings video-worker section."""
+        doc = self.firebase.get_document(SETTINGS_COLLECTION, EVALUATION_ROUTING_DOC_ID) or {}
+        return self._routing_payload(doc)
+
+    def set_evaluation_routing(
+        self,
+        *,
+        personal_share: int,
+        company_share: int,
+        updated_by: str,
+    ) -> dict[str, Any]:
+        """Save a new repeating pattern. The next video starts at the beginning of it."""
+        urls = worker_urls()
+        if personal_share > 0 and PERSONAL_KEY not in urls:
+            raise ValueError("The personal evaluation service is not configured on this API.")
+        if company_share > 0 and COMPANY_KEY not in urls:
+            raise ValueError("The company evaluation service is not configured on this API.")
+        if personal_share <= 0 and company_share <= 0:
+            raise ValueError("Set a share for at least one evaluation service.")
+
+        now = now_ist_iso()
+        existing = self.firebase.get_document(SETTINGS_COLLECTION, EVALUATION_ROUTING_DOC_ID) or {}
+        self.firebase.set_document(
+            SETTINGS_COLLECTION,
+            EVALUATION_ROUTING_DOC_ID,
+            {
+                "personal_share": personal_share,
+                "company_share": company_share,
+                "next_index": 0,
+                "created_at": existing.get("created_at") or now,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+        )
+        return self.get_evaluation_routing()
+
+    def reserve_evaluation_worker(self) -> str:
+        """
+        Take the next slot in the saved pattern.
+
+        The chosen worker is stored on the Cloud Task, so a retry stays there.
+        """
+        urls = worker_urls()
+
+        def _txn(transaction):
+            doc = (
+                self.firebase.txn_get(transaction, SETTINGS_COLLECTION, EVALUATION_ROUTING_DOC_ID)
+                or {}
+            )
+            personal_share, company_share = shares_from_document(
+                doc,
+                company_configured=COMPANY_KEY in urls,
+            )
+            sequence = build_sequence(
+                personal_share,
+                company_share,
+                personal_configured=PERSONAL_KEY in urls,
+                company_configured=COMPANY_KEY in urls,
+            )
+            if not sequence:
+                raise ValueError("No evaluation service is configured")
+            next_index = doc.get("next_index") or 0
+            try:
+                next_index = int(next_index)
+            except (TypeError, ValueError):
+                next_index = 0
+            if next_index < 0:
+                next_index = 0
+            choice = sequence[next_index % len(sequence)]
+            now = now_ist_iso()
+            self.firebase.txn_set(
+                transaction,
+                SETTINGS_COLLECTION,
+                EVALUATION_ROUTING_DOC_ID,
+                {
+                    "personal_share": personal_share,
+                    "company_share": company_share,
+                    "next_index": next_index + 1,
+                    "created_at": doc.get("created_at") or now,
+                    "updated_at": doc.get("updated_at") or now,
+                    "updated_by": doc.get("updated_by") or "",
+                },
+            )
+            return choice
+
+        return self.firebase.run_transaction(_txn)
+
+    def _routing_payload(self, doc: dict[str, Any]) -> dict[str, Any]:
+        urls = worker_urls()
+        personal_share, company_share = shares_from_document(
+            doc,
+            company_configured=COMPANY_KEY in urls,
+        )
+        sequence = build_sequence(
+            personal_share,
+            company_share,
+            personal_configured=PERSONAL_KEY in urls,
+            company_configured=COMPANY_KEY in urls,
+        )
+        workers = []
+        for item in WORKER_CATALOG:
+            key = item["key"]
+            workers.append(
+                {
+                    "key": key,
+                    "name": item["name"],
+                    "project_id": item["project_id"],
+                    "configured": key in urls,
+                    "share": personal_share if key == PERSONAL_KEY else company_share,
+                    "url": urls.get(key),
+                }
+            )
+        try:
+            next_index = int(doc.get("next_index") or 0)
+        except (TypeError, ValueError):
+            next_index = 0
+        if next_index < 0:
+            next_index = 0
+        return {
+            "personal_share": personal_share,
+            "company_share": company_share,
+            "next_index": next_index,
+            "sequence": sequence,
+            "summary": routing_summary(sequence),
+            "scope": "Video AI analysis. GitHub AI evaluation stays on this API.",
+            "workers": workers,
         }
 
     def get_registration_config(self) -> dict[str, Any]:

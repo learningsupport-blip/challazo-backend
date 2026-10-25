@@ -110,10 +110,10 @@ steps:
       - |
         gcloud tasks queues describe evaluation-jobs --location=asia-south1 \
           || gcloud tasks queues create evaluation-jobs --location=asia-south1
-        # Four evaluations at a time, matching challazo-evaluator max instances.
+        # Five at a time: four on the Tier 1 worker and one on the company worker.
         # A 429 stays retryable; the rest of a larger batch waits in this queue.
         gcloud tasks queues update evaluation-jobs --location=asia-south1 \
-          --max-concurrent-dispatches=4 \
+          --max-concurrent-dispatches=5 \
           --max-dispatches-per-second=1 \
           --min-backoff=120s \
           --max-backoff=3600s
@@ -142,10 +142,18 @@ steps:
           --region=asia-south1 \
           --format='value(spec.template.spec.containers[0].env.filter("name:CLOUD_TASKS_TARGET_URL").extract(value).flatten())' \
           2>/dev/null || true)
+        COMPANY_TARGET=$$(gcloud run services describe ${_SERVICE_NAME} \
+          --region=asia-south1 \
+          --format='value(spec.template.spec.containers[0].env.filter("name:CLOUD_TASKS_COMPANY_TARGET_URL").extract(value).flatten())' \
+          2>/dev/null || true)
+        if [ -z "$$COMPANY_TARGET" ]; then
+          COMPANY_TARGET="https://challazo-evaluator-25vbzbwdva-el.a.run.app/internal/jobs/evaluate-submission"
+        fi
         TARGET_ENV=""
         if [ -n "$$CURRENT_TARGET" ]; then
           TARGET_ENV="|CLOUD_TASKS_TARGET_URL=$$CURRENT_TARGET"
         fi
+        TARGET_ENV="$${TARGET_ENV}|CLOUD_TASKS_COMPANY_TARGET_URL=$$COMPANY_TARGET"
 
         gcloud run deploy ${_SERVICE_NAME} \
           --image="$$IMAGE" \

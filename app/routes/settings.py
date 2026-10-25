@@ -2,6 +2,8 @@
 Super Admin Application Settings.
 
     GET  /super-admin/settings                         -> settings flags (sidebar page)
+    GET  /super-admin/settings/evaluation-routing      -> video worker shares
+    PUT  /super-admin/settings/evaluation-routing      -> save video worker shares
     GET  /super-admin/settings/registration            -> OTP toggles and waiting counts
     PUT  /super-admin/settings/registration            -> turn email/mobile OTP on or off
     POST /super-admin/settings/registration/release    -> ask the next batch to verify
@@ -27,6 +29,8 @@ from app.models.settings_model import (
     ChangeProfilePasswordRequest,
     DeleteHackathonRequest,
     DeleteHackathonResponse,
+    EvaluationRoutingResponse,
+    EvaluationRoutingUpdate,
     HackathonDeleteListItem,
     HackathonDeletePreview,
     RegistrationConfigUpdate,
@@ -58,6 +62,55 @@ async def get_application_settings(
     _ = super_admin
     payload = await run_sync(service.get_settings_public)
     return AppSettingsResponse(**payload)
+
+
+@router.get("/evaluation-routing", response_model=EvaluationRoutingResponse)
+async def get_evaluation_routing(
+    super_admin: CurrentUser = Depends(get_super_admin_user),
+    service: AppSettingsService = Depends(get_app_settings_service),
+) -> EvaluationRoutingResponse:
+    """
+    Video AI worker shares for Application Settings.
+
+    ``sequence`` is the repeating order. Index 0 is the next video after a save.
+    GitHub AI evaluation is not part of this setting.
+    """
+    _ = super_admin
+    payload = await run_sync(service.get_evaluation_routing)
+    return EvaluationRoutingResponse(**payload)
+
+
+@router.put("/evaluation-routing", response_model=EvaluationRoutingResponse)
+async def update_evaluation_routing(
+    request: EvaluationRoutingUpdate,
+    super_admin: CurrentUser = Depends(get_super_admin_user),
+    service: AppSettingsService = Depends(get_app_settings_service),
+) -> EvaluationRoutingResponse:
+    """
+    Save how many videos go to each project before the pattern repeats.
+
+    A personal share of 4 and a company share of 1 sends four videos to the
+    personal project, then one to the company project. Jobs already queued
+    keep the worker they were given.
+    """
+    try:
+        saved = await run_sync(
+            service.set_evaluation_routing,
+            personal_share=request.personal_share,
+            company_share=request.company_share,
+            updated_by=super_admin.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except AppError:
+        raise
+    except Exception as exc:
+        logger.exception("Saving evaluation routing failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save evaluation routing",
+        ) from exc
+    return EvaluationRoutingResponse(**saved)
 
 
 @router.post("/change-profile-password", status_code=200)

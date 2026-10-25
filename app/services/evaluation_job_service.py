@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from fastapi import BackgroundTasks
 
+from app.services.evaluation_routing import worker_urls
 from app.utils.ids import new_id
 
 
@@ -56,7 +57,7 @@ class EvaluationJobService:
         if self.mode_override == "cloud_tasks":
             return "cloud_tasks"
         # auto: use Cloud Tasks only when fully configured
-        if self.queue and self.target_url and self.job_secret and self.project:
+        if self.queue and self.job_secret and self.project and worker_urls():
             return "cloud_tasks"
         return "background"
 
@@ -66,11 +67,12 @@ class EvaluationJobService:
         evaluation_criteria: str | None,
     ) -> str:
         """Create a Cloud Task that POSTs to the internal worker. Returns task name."""
-        task_name = self._enqueue_cloud_task(submission_id, evaluation_criteria)
+        task_name, worker_key = self._enqueue_cloud_task(submission_id, evaluation_criteria)
         logger.info(
-            "Enqueued Cloud Task for submission %s (task=%s)",
+            "Enqueued Cloud Task for submission %s (task=%s, worker=%s)",
             submission_id,
             task_name,
+            worker_key,
         )
         return task_name
 
@@ -158,17 +160,13 @@ class EvaluationJobService:
         self,
         submission_id: str,
         evaluation_criteria: str | None,
-    ) -> str:
+    ) -> tuple[str, str]:
         # Imported lazily so local/dev without the package still loads the app
         # when running in background mode.
         from google.cloud import tasks_v2
         from google.protobuf import duration_pb2
 
-        url = (self.target_url or os.getenv("CLOUD_TASKS_TARGET_URL") or "").strip()
-        if not url:
-            raise RuntimeError(
-                "CLOUD_TASKS_TARGET_URL is not set, so the evaluation job cannot be queued."
-            )
+        worker_key, url = self._select_worker_url()
 
         client = tasks_v2.CloudTasksClient()
         parent = client.queue_path(self.project, self.location, self.queue)
@@ -201,4 +199,30 @@ class EvaluationJobService:
         }
 
         created = client.create_task(request={"parent": parent, "task": task})
-        return created.name
+        return created.name, worker_key
+
+    def _select_worker_url(self) -> tuple[str, str]:
+        """
+        Pick the worker for this video.
+
+        One configured worker keeps the previous behaviour and does not read settings.
+        Two workers follow the superadmin share saved in Application Settings.
+        """
+        urls = worker_urls()
+        if not urls:
+            raise RuntimeError(
+                "CLOUD_TASKS_TARGET_URL is not set, so the evaluation job cannot be queued."
+            )
+        if len(urls) == 1:
+            key, url = next(iter(urls.items()))
+            return key, url
+
+        from app.services.app_settings_service import AppSettingsService
+
+        key = AppSettingsService().reserve_evaluation_worker()
+        url = urls.get(key)
+        if not url:
+            raise RuntimeError(
+                "CLOUD_TASKS_TARGET_URL is not set, so the evaluation job cannot be queued."
+            )
+        return key, url

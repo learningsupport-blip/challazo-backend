@@ -178,3 +178,36 @@ class ResetDatabaseResponse(BaseModel):
     message: str
     deleted_counts: dict[str, int]
     preserved: list[str]
+
+
+class EvaluationWorkerSetting(BaseModel):
+    """One fixed video-evaluation worker the superadmin can give a share of jobs."""
+
+    key: str
+    name: str
+    project_id: str
+    configured: bool
+    share: int = Field(..., ge=0, le=20)
+    url: Optional[str] = None
+
+
+class EvaluationRoutingResponse(BaseModel):
+    """How the next video analyses are divided. GitHub AI is not included."""
+
+    personal_share: int
+    company_share: int
+    next_index: int = Field(
+        0,
+        description="How many videos have been handed out in the current pattern.",
+    )
+    sequence: list[str]
+    summary: str
+    scope: str
+    workers: list[EvaluationWorkerSetting]
+
+
+class EvaluationRoutingUpdate(BaseModel):
+    """Save how many videos go to each project before the pattern repeats."""
+
+    personal_share: int = Field(..., ge=0, le=20)
+    company_share: int = Field(..., ge=0, le=20)

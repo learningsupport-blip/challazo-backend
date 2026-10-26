@@ -611,6 +611,29 @@ def test_niat_university_still_requires_niat_id():
     assert exc.value.code == "NIAT_ID_REQUIRED"
 
 
+def test_niat_id_accepts_any_length():
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)
+    service, firebase, _ = _service(now)
+    session_id = _verified_session(service, firebase)
+    _niat_catalogue(firebase)
+    niat_id = "9" * 80
+    service.complete(
+        RegisterCompleteRequest(
+            session_id=session_id,
+            first_name="Ada",
+            last_name="Lovelace",
+            email="ada@example.com",
+            university_id="uni-niat",
+            batch_id="batch-2024",
+            niat_id=niat_id,
+            mobile_number="+919876543210",
+            password="secret12",
+        )
+    )
+    user = firebase.get_document("users", "new-student-uid")
+    assert user["niat_id"] == niat_id
+
+
 def test_low_ip_cap_still_blocks_when_configured(monkeypatch):
     monkeypatch.setenv("OTP_MAX_SENDS_PER_IP_PER_HOUR", "2")
     now = datetime(2026, 8, 18, 12, 0, tzinfo=IST)

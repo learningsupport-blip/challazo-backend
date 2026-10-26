@@ -13,8 +13,9 @@ from fastapi import Response
 
 
 AUTH_COOKIE_NAME = "access_token"
-# Firebase ID tokens expire in 3600 seconds.
-AUTH_COOKIE_MAX_AGE = 3600
+# One day for every role. The value in the cookie is a Firebase session cookie,
+# not the one-hour ID token.
+AUTH_COOKIE_MAX_AGE = 86400
 
 # Readable by JS on same-origin SPAs; cross-origin clients must use the token
 # returned in the login / GET /auth/csrf JSON body (document.cookie cannot see
@@ -70,11 +71,11 @@ def new_csrf_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def set_auth_cookie(response: Response, id_token: str) -> None:
-    """Attach the Firebase ID token as an HttpOnly session cookie."""
+def set_auth_cookie(response: Response, session_cookie: str) -> None:
+    """Attach the Firebase session cookie. It lasts one day for every role."""
     response.set_cookie(
         key=AUTH_COOKIE_NAME,
-        value=id_token,
+        value=session_cookie,
         httponly=True,
         secure=_cookie_secure(),
         samesite=_cookie_samesite(),

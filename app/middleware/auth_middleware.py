@@ -129,8 +129,8 @@ def _authenticate_token(
         )
 
     try:
-        # Phase 5a: reject revoked tokens (e.g. after password change).
-        decoded_token = firebase.verify_id_token(token, check_revoked=True)
+        # Session cookies last one day. Bearer ID tokens still last one hour.
+        decoded_token = firebase.verify_auth_token(token, check_revoked=True)
     except ValueError as token_error:
         logger.warning("Invalid ID token: %s", str(token_error))
         raise HTTPException(
@@ -205,8 +205,8 @@ async def get_current_user(
     """
     Dependency for getting the current authenticated user.
 
-    Reads the Firebase ID token from the HttpOnly cookie first, then falls
-    back to the Authorization Bearer header (useful for API clients/Swagger).
+    Reads the one-day session cookie first, then falls back to the
+    Authorization Bearer header (useful for API clients/Swagger).
 
     Token verification and Firestore user lookup run via ``run_sync`` so they
     do not block the asyncio event loop (behaviour unchanged for happy path).

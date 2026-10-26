@@ -332,7 +332,7 @@ class LoginResponse(BaseModel):
     """
     Schema for login response.
 
-    The Firebase ID token is stored in an HttpOnly ``access_token`` cookie.
+    A one-day Firebase session cookie is stored in an HttpOnly ``access_token`` cookie.
     ``csrf_token`` is also returned in the body for cross-origin SPAs (e.g.
     Vercel frontend → Cloud Run API) where ``document.cookie`` cannot read
     API-domain cookies — the SPA must echo it as ``X-CSRF-Token`` on POST/PUT/PATCH/DELETE.

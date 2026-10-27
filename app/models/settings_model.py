@@ -2,7 +2,7 @@
 Admin application-settings schemas (profile password + DB reset).
 """
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -194,6 +194,7 @@ class EvaluationWorkerSetting(BaseModel):
 class EvaluationRoutingResponse(BaseModel):
     """How the next video analyses are divided. GitHub AI is not included."""
 
+    mode: Literal["personal", "company", "both"] = "personal"
     personal_share: int
     company_share: int
     next_index: int = Field(
@@ -207,7 +208,13 @@ class EvaluationRoutingResponse(BaseModel):
 
 
 class EvaluationRoutingUpdate(BaseModel):
-    """Save how many videos go to each project before the pattern repeats."""
+    """
+    Choose one project, or both.
 
+    Shares are used only when ``mode`` is ``both``. Omit ``mode`` to keep the
+    older meaning: a share of 0 turns that project off.
+    """
+
+    mode: Optional[Literal["personal", "company", "both"]] = None
     personal_share: int = Field(..., ge=0, le=20)
     company_share: int = Field(..., ge=0, le=20)

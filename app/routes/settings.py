@@ -70,10 +70,11 @@ async def get_evaluation_routing(
     service: AppSettingsService = Depends(get_app_settings_service),
 ) -> EvaluationRoutingResponse:
     """
-    Video AI worker shares for Application Settings.
+    Which project runs video AI analysis.
 
-    ``sequence`` is the repeating order. Index 0 is the next video after a save.
-    GitHub AI evaluation is not part of this setting.
+    ``mode`` is ``personal``, ``company``, or ``both``. Shares and ``sequence``
+    apply when both projects are selected. GitHub AI evaluation is not part of
+    this setting.
     """
     _ = super_admin
     payload = await run_sync(service.get_evaluation_routing)
@@ -87,17 +88,18 @@ async def update_evaluation_routing(
     service: AppSettingsService = Depends(get_app_settings_service),
 ) -> EvaluationRoutingResponse:
     """
-    Save how many videos go to each project before the pattern repeats.
+    Save which project runs video AI analysis.
 
-    A personal share of 4 and a company share of 1 sends four videos to the
-    personal project, then one to the company project. Jobs already queued
-    keep the worker they were given.
+    ``personal`` or ``company`` sends every video to that project. ``both``
+    repeats the shares (4 and 1 sends four personal videos, then one company
+    video). Jobs already queued keep the worker they were given.
     """
     try:
         saved = await run_sync(
             service.set_evaluation_routing,
             personal_share=request.personal_share,
             company_share=request.company_share,
+            mode=request.mode,
             updated_by=super_admin.user_id,
         )
     except ValueError as exc:

@@ -17,6 +17,7 @@ from app.routes import (
     auth,
     evaluation_prompt,
     evaluation_requirement,
+    external_hackathons,
     hackathon,
     internal_jobs,
     metric_scoring,
@@ -135,6 +136,7 @@ app.include_router(hackathon.router)
 app.include_router(teams.router)
 app.include_router(theme.router)
 app.include_router(university.router)
+app.include_router(external_hackathons.router)
 app.include_router(evaluation_requirement.router)
 app.include_router(evaluation_prompt.router)
 app.include_router(metric_scoring.router)

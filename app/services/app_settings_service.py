@@ -59,6 +59,8 @@ WIPEABLE_COLLECTIONS: tuple[str, ...] = (
     "ai_evaluation_prompt",
     "submissions",
     "analysis",
+    "external_hackathons",
+    "external_submissions",
     TEAMS,
     ENROLLMENTS,
     JOIN_CODES,

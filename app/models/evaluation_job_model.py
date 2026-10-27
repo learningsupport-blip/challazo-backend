@@ -12,6 +12,12 @@ class EvaluateJobRequest(BaseModel):
     evaluation_criteria: Optional[str] = Field(None, max_length=2000)
 
 
+class EvaluateExternalJobRequest(BaseModel):
+    """Body posted to the external-submission worker. Regular jobs do not send this."""
+
+    external_submission_id: str = Field(..., min_length=1)
+
+
 class EvaluateJobResponse(BaseModel):
     """Worker acknowledgement (Cloud Tasks treats 2xx as success)."""
 

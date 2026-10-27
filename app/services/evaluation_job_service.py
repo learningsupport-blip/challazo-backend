@@ -76,6 +76,24 @@ class EvaluationJobService:
         )
         return task_name
 
+    def enqueue_external_cloud_task(self, external_submission_id: str) -> str:
+        """Queue Gemini for an external submission. Regular jobs are unchanged."""
+        from app.services.external_evaluation_service import external_job_url
+
+        worker_key, url = self._select_worker_url()
+        task_name, _worker = self._enqueue_http_task(
+            url=external_job_url(url),
+            payload={"external_submission_id": external_submission_id},
+            task_prefix=f"ext-{external_submission_id[:32]}",
+        )
+        logger.info(
+            "Enqueued external Cloud Task for %s (task=%s, worker=%s)",
+            external_submission_id,
+            task_name,
+            worker_key,
+        )
+        return task_name
+
     def enqueue_background(
         self,
         submission_id: str,
@@ -161,29 +179,35 @@ class EvaluationJobService:
         submission_id: str,
         evaluation_criteria: str | None,
     ) -> tuple[str, str]:
-        # Imported lazily so local/dev without the package still loads the app
-        # when running in background mode.
+        # Task client import stays inside ``_enqueue_http_task`` so local
+        # processes that never queue still load this module.
+        worker_key, url = self._select_worker_url()
+        task_name, _worker = self._enqueue_http_task(
+            url=url,
+            payload={
+                "submission_id": submission_id,
+                "evaluation_criteria": evaluation_criteria,
+            },
+            task_prefix=f"eval-{submission_id[:32]}",
+        )
+        return task_name, worker_key
+
+    def _enqueue_http_task(
+        self,
+        *,
+        url: str,
+        payload: dict[str, Any],
+        task_prefix: str,
+    ) -> tuple[str, str]:
         from google.cloud import tasks_v2
         from google.protobuf import duration_pb2
 
-        worker_key, url = self._select_worker_url()
-
         client = tasks_v2.CloudTasksClient()
         parent = client.queue_path(self.project, self.location, self.queue)
-
-        payload = {
-            "submission_id": submission_id,
-            "evaluation_criteria": evaluation_criteria,
-        }
         body = json.dumps(payload).encode("utf-8")
-
-        # Unique task id per enqueue so re-evaluate after completion is allowed.
-        # Concurrent double-click is still blocked by status=processing → 409.
-        task_id = f"eval-{submission_id[:32]}-{new_id()}"
-
-        # Cloud Tasks max HTTP dispatch deadline is 30 minutes.
+        # Unique task id per enqueue so a later re-evaluate is allowed.
+        task_id = f"{task_prefix}-{new_id()}"
         dispatch_deadline = duration_pb2.Duration(seconds=1800)
-
         task: dict[str, Any] = {
             "name": f"{parent}/tasks/{task_id}",
             "http_request": {
@@ -197,9 +221,8 @@ class EvaluationJobService:
             },
             "dispatch_deadline": dispatch_deadline,
         }
-
         created = client.create_task(request={"parent": parent, "task": task})
-        return created.name, worker_key
+        return created.name, ""
 
     def _select_worker_url(self) -> tuple[str, str]:
         """

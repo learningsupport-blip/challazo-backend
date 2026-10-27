@@ -21,9 +21,12 @@ from app.services.evaluation_routing import (
     EVALUATION_ROUTING_DOC_ID,
     PERSONAL_KEY,
     WORKER_CATALOG,
-    build_sequence,
+    active_sequence,
+    infer_mode,
+    resolve_mode,
     routing_summary,
     shares_from_document,
+    validate_routing_choice,
     worker_urls,
 )
 from app.services.firebase import FirebaseService
@@ -56,6 +59,8 @@ WIPEABLE_COLLECTIONS: tuple[str, ...] = (
     "ai_evaluation_prompt",
     "submissions",
     "analysis",
+    "external_hackathons",
+    "external_submissions",
     TEAMS,
     ENROLLMENTS,
     JOIN_CODES,
@@ -218,15 +223,26 @@ class AppSettingsService:
         personal_share: int,
         company_share: int,
         updated_by: str,
+        mode: str | None = None,
     ) -> dict[str, Any]:
-        """Save a new repeating pattern. The next video starts at the beginning of it."""
+        """
+        Save which project runs video AI analysis.
+
+        ``personal`` or ``company`` sends every video there. ``both`` uses the
+        shares. Omitting ``mode`` keeps the previous meaning of the two shares.
+        The next video starts at the beginning of the saved pattern.
+        """
         urls = worker_urls()
-        if personal_share > 0 and PERSONAL_KEY not in urls:
-            raise ValueError("The personal evaluation service is not configured on this API.")
-        if company_share > 0 and COMPANY_KEY not in urls:
-            raise ValueError("The company evaluation service is not configured on this API.")
-        if personal_share <= 0 and company_share <= 0:
-            raise ValueError("Set a share for at least one evaluation service.")
+        chosen = mode or infer_mode(personal_share, company_share)
+        if not chosen:
+            raise ValueError("Choose the personal project, the company project, or both.")
+        validate_routing_choice(
+            chosen,
+            personal_share,
+            company_share,
+            personal_configured=PERSONAL_KEY in urls,
+            company_configured=COMPANY_KEY in urls,
+        )
 
         now = now_ist_iso()
         existing = self.firebase.get_document(SETTINGS_COLLECTION, EVALUATION_ROUTING_DOC_ID) or {}
@@ -234,6 +250,7 @@ class AppSettingsService:
             SETTINGS_COLLECTION,
             EVALUATION_ROUTING_DOC_ID,
             {
+                "mode": chosen,
                 "personal_share": personal_share,
                 "company_share": company_share,
                 "next_index": 0,
@@ -261,7 +278,9 @@ class AppSettingsService:
                 doc,
                 company_configured=COMPANY_KEY in urls,
             )
-            sequence = build_sequence(
+            mode = resolve_mode(doc, personal_share, company_share)
+            sequence = active_sequence(
+                mode,
                 personal_share,
                 company_share,
                 personal_configured=PERSONAL_KEY in urls,
@@ -283,6 +302,7 @@ class AppSettingsService:
                 SETTINGS_COLLECTION,
                 EVALUATION_ROUTING_DOC_ID,
                 {
+                    "mode": mode,
                     "personal_share": personal_share,
                     "company_share": company_share,
                     "next_index": next_index + 1,
@@ -301,7 +321,9 @@ class AppSettingsService:
             doc,
             company_configured=COMPANY_KEY in urls,
         )
-        sequence = build_sequence(
+        mode = resolve_mode(doc, personal_share, company_share)
+        sequence = active_sequence(
+            mode,
             personal_share,
             company_share,
             personal_configured=PERSONAL_KEY in urls,
@@ -327,6 +349,7 @@ class AppSettingsService:
         if next_index < 0:
             next_index = 0
         return {
+            "mode": mode,
             "personal_share": personal_share,
             "company_share": company_share,
             "next_index": next_index,

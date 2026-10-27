@@ -89,6 +89,65 @@ def test_save_rejects_a_share_for_a_missing_company_worker(monkeypatch):
         raise AssertionError("company share should be rejected when that worker is unset")
 
 
+def test_choosing_one_project_sends_every_video_there(monkeypatch):
+    monkeypatch.setenv("CLOUD_TASKS_TARGET_URL", "https://personal.example/job")
+    monkeypatch.setenv("CLOUD_TASKS_COMPANY_TARGET_URL", "https://company.example/job")
+    firebase = _RoutingFirebase({"personal_share": 5, "company_share": 0, "next_index": 2})
+    service = AppSettingsService(firebase=firebase)
+
+    current = service.get_evaluation_routing()
+    assert current["mode"] == PERSONAL_KEY
+    assert current["sequence"] == [PERSONAL_KEY]
+    assert current["summary"] == "Every video uses the personal project."
+
+    saved = service.set_evaluation_routing(
+        mode=COMPANY_KEY,
+        personal_share=4,
+        company_share=1,
+        updated_by="admin",
+    )
+    assert saved["mode"] == COMPANY_KEY
+    assert saved["personal_share"] == 4
+    assert saved["company_share"] == 1
+    assert saved["sequence"] == [COMPANY_KEY]
+    assert saved["summary"] == "Every video uses the company project."
+    assert [service.reserve_evaluation_worker() for _ in range(3)] == [
+        COMPANY_KEY,
+        COMPANY_KEY,
+        COMPANY_KEY,
+    ]
+
+
+def test_both_keeps_the_share_pattern(monkeypatch):
+    monkeypatch.setenv("CLOUD_TASKS_TARGET_URL", "https://personal.example/job")
+    monkeypatch.setenv("CLOUD_TASKS_COMPANY_TARGET_URL", "https://company.example/job")
+    service = AppSettingsService(firebase=_RoutingFirebase())
+    saved = service.set_evaluation_routing(
+        mode="both",
+        personal_share=4,
+        company_share=1,
+        updated_by="admin",
+    )
+    assert saved["sequence"] == [
+        PERSONAL_KEY,
+        PERSONAL_KEY,
+        PERSONAL_KEY,
+        PERSONAL_KEY,
+        COMPANY_KEY,
+    ]
+    try:
+        service.set_evaluation_routing(
+            mode="both",
+            personal_share=5,
+            company_share=0,
+            updated_by="admin",
+        )
+    except ValueError as exc:
+        assert "each project" in str(exc)
+    else:
+        raise AssertionError("both requires a share for each project")
+
+
 def test_save_starts_the_pattern_over(monkeypatch):
     monkeypatch.setenv("CLOUD_TASKS_TARGET_URL", "https://personal.example/job")
     monkeypatch.setenv("CLOUD_TASKS_COMPANY_TARGET_URL", "https://company.example/job")

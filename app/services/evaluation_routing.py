@@ -1,9 +1,10 @@
 """
 Choose which Cloud Run worker runs the next video AI analysis.
 
-Shares are counts, not percentages. A personal share of 4 and a company share
-of 1 sends four videos to the personal project, then one to the company
-project, and then repeats. GitHub AI evaluation does not use this.
+A superadmin chooses the personal project, the company project, or both.
+Shares apply only when both are selected: 4 and 1 sends four videos to the
+personal project, then one to the company project, and then repeats.
+GitHub AI evaluation does not use this.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ import os
 
 PERSONAL_KEY = "personal"
 COMPANY_KEY = "company"
+MODE_BOTH = "both"
+ROUTING_MODES = (PERSONAL_KEY, COMPANY_KEY, MODE_BOTH)
 MAX_SHARE = 20
 EVALUATION_ROUTING_DOC_ID = "evaluation_routing"
 
@@ -78,6 +81,88 @@ def shares_from_document(
     if "personal_share" not in stored and "company_share" not in stored:
         return default_shares(company_configured=company_configured)
     return clamp_share(stored.get("personal_share")), clamp_share(stored.get("company_share"))
+
+
+def infer_mode(personal_share: int, company_share: int) -> str | None:
+    """Mode implied by shares when a saved document has no explicit choice."""
+    if personal_share > 0 and company_share > 0:
+        return MODE_BOTH
+    if personal_share > 0:
+        return PERSONAL_KEY
+    if company_share > 0:
+        return COMPANY_KEY
+    return None
+
+
+def resolve_mode(doc: dict | None, personal_share: int, company_share: int) -> str:
+    """Explicit choice wins. Older documents are read from their shares."""
+    stored = (doc or {}).get("mode")
+    if stored in ROUTING_MODES:
+        return str(stored)
+    return infer_mode(personal_share, company_share) or PERSONAL_KEY
+
+
+def active_sequence(
+    mode: str,
+    personal_share: int,
+    company_share: int,
+    *,
+    personal_configured: bool,
+    company_configured: bool,
+) -> list[str]:
+    """
+    One chosen project receives every video.
+
+    ``both`` keeps the repeating share pattern. A project that is not configured
+    is left out so a missing URL cannot be selected at runtime.
+    """
+    if mode == PERSONAL_KEY and personal_configured:
+        return [PERSONAL_KEY]
+    if mode == COMPANY_KEY and company_configured:
+        return [COMPANY_KEY]
+    if mode == MODE_BOTH:
+        return build_sequence(
+            personal_share,
+            company_share,
+            personal_configured=personal_configured,
+            company_configured=company_configured,
+        )
+    return build_sequence(
+        personal_share,
+        company_share,
+        personal_configured=personal_configured,
+        company_configured=company_configured,
+    )
+
+
+def validate_routing_choice(
+    mode: str,
+    personal_share: int,
+    company_share: int,
+    *,
+    personal_configured: bool,
+    company_configured: bool,
+) -> None:
+    """Reject a choice the API cannot run. Shares are stored even for one project."""
+    if mode == PERSONAL_KEY:
+        if not personal_configured:
+            raise ValueError("The personal evaluation service is not configured on this API.")
+        return
+    if mode == COMPANY_KEY:
+        if not company_configured:
+            raise ValueError("The company evaluation service is not configured on this API.")
+        return
+    if mode == MODE_BOTH:
+        if not personal_configured:
+            raise ValueError("The personal evaluation service is not configured on this API.")
+        if not company_configured:
+            raise ValueError("The company evaluation service is not configured on this API.")
+        if personal_share <= 0 or company_share <= 0:
+            raise ValueError(
+                "Set how many videos each project receives, or choose one project."
+            )
+        return
+    raise ValueError("Choose the personal project, the company project, or both.")
 
 
 def build_sequence(

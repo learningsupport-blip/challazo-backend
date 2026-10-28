@@ -292,6 +292,65 @@ def apply_manual_scores(
     return _finalize_scorecard(scorecard)
 
 
+def apply_evaluator_field_scores(
+    scorecard: dict[str, Any],
+    field_scores: list[dict[str, Any]],
+    metric_defs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Score every rubric field by hand, using the same metric keys as AI."""
+    if not field_scores:
+        raise ValueError("field_scores must include every weighted scorecard field")
+
+    from app.models.metric_scoring_model import canonicalize_metric_field_key
+
+    by_key = {item["field_key"]: item for item in (scorecard.get("metrics") or [])}
+    scorecard_keys = set(by_key.keys())
+    seen: set[str] = set()
+    manual_payloads: list[dict[str, Any]] = []
+
+    for payload in field_scores:
+        raw_key = (payload.get("field_key") or "").strip()
+        if not raw_key:
+            raise ValueError("field_scores entries require field_key")
+        key = canonicalize_metric_field_key(raw_key, scorecard_keys)
+        if key not in by_key:
+            raise ValueError(f"field_key '{raw_key}' is not on this hackathon scorecard")
+        if key in seen:
+            raise ValueError(f"Duplicate field_score for '{key}'")
+        seen.add(key)
+
+        item = by_key[key]
+        if item.get("scoring_mode") == "manual":
+            manual_payloads.append({**payload, "field_key": key})
+            continue
+
+        if payload.get("score") is None:
+            raise ValueError(f"Field '{key}' requires a numeric score")
+        try:
+            score = float(payload["score"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Field '{key}' requires a numeric score") from exc
+        max_score = float(item.get("max_score") or 10)
+        if score < 0 or score > max_score:
+            raise ValueError(f"Field '{key}' score must be between 0 and {max_score}")
+        item["score"] = score
+        item["max_score"] = max_score
+        item["source"] = "evaluator"
+        item["skipped"] = False
+        item["rationale"] = payload.get("rationale")
+
+    if manual_payloads:
+        scorecard = apply_manual_scores(scorecard, manual_payloads, metric_defs=metric_defs)
+
+    for item in scorecard.get("metrics") or []:
+        if item.get("weight") is None:
+            continue
+        if item.get("score") is None:
+            raise ValueError(f"Score for '{item.get('field_key')}' is required")
+
+    return _finalize_scorecard(scorecard)
+
+
 def _finalize_scorecard(scorecard: dict[str, Any]) -> dict[str, Any]:
     metrics = scorecard.get("metrics") or []
     ai_total = 0.0

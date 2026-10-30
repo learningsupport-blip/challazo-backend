@@ -170,7 +170,7 @@ Paths below are the live routers. Request bodies and response fields are the Pyd
 |---|---|---|
 | `GET` | `/health` | Process health and IST server time |
 | `GET` | `/` | Welcome payload |
-| `GET` | `/auth/registration-config` | Whether self-service registration is open |
+| `GET` | `/auth/registration-config` | Per-role email and mobile verification flags |
 | `POST` | `/auth/login` | Session cookie |
 | `GET` | `/auth/csrf` | CSRF token for an existing session |
 | `POST` | `/auth/logout` | Clear the cookie |
@@ -240,6 +240,7 @@ Leaderboard rank uses `final_score` on submissions whose `review_status` is `app
 |---|---|---|
 | `GET` | `/hackathons/{id}/rounds/{round_index}/participation` | This student's enrollment |
 | `POST` | `/hackathons/{id}/rounds/{round_index}/enroll/solo` | Solo round |
+| `POST` | `/hackathons/{id}/rounds/{round_index}/enroll/revert` | Undo Solo, leader, or member before a submission |
 | `POST` | `/hackathons/{id}/rounds/{round_index}/teams/create` | Create a team; 6-digit join code, 5 minutes |
 | `POST` | `/hackathons/{id}/rounds/{round_index}/teams/join` | Join with that code |
 | `POST` | `/hackathons/{id}/rounds/{round_index}/teams/join-code` | Leader refreshes the code |
@@ -265,7 +266,7 @@ Leaderboard rank uses `final_score` on submissions whose `review_status` is `app
 | `POST` | `/submissions/{id}/approve-evaluation` | admin | Approve score |
 | `POST` | `/submissions/{id}/request-changes` | admin | Send back |
 | `POST` | `/submissions/{id}/publish` | admin | Show report to the student |
-| `POST` | `/submissions/{id}/assign` | admin | Assign or reassign; reassign requires a reason |
+| `POST` | `/submissions/{id}/assign` | admin | Assign, reassign, or unassign. A remark is required only when one evaluator replaces another |
 | `GET` | `/submissions/assigned-to-me` | evaluator | Flat assigned list |
 | `GET` | `/submissions/evaluator/hackathons` | evaluator | Hackathons that have their work |
 | `GET` | `/submissions/evaluator/hackathons/{id}` | evaluator | Their rows for one hackathon |
@@ -312,6 +313,7 @@ Direct browser upload needs GCS CORS that includes the frontend origin. The buck
 | Prefix | Who | Operations |
 |---|---|---|
 | `/admin/overview` | admin | Counts for the dashboard |
+| `/admin/analysis` | admin | Hackathon and evaluator performance. Custom roles need the Analysis permission |
 | `/admin/users` | admin | Paginated user list |
 | `/admin/user/{user_id}` | admin | Get, patch, delete |
 | `/admin/evaluators` | admin | Approved and all evaluator lists |
@@ -323,7 +325,7 @@ Direct browser upload needs GCS CORS that includes the frontend origin. The buck
 | `/admin/access/users` | super admin | Staff logins: list, create, patch, delete |
 | `/admin/access/logs` | super admin | Activity log, paginated |
 | `/admin/access/observation` | super admin | Observation summary |
-| `/super-admin/settings` | super admin | App settings, profile password, registration open/close, hackathon delete, database reset |
+| `/super-admin/settings` | super admin | App settings, profile password, per-role verification, hackathon delete, database reset |
 
 `POST /super-admin/settings/reset-database` and hackathon delete remove Firestore data for that action. Treat them as production-destructive.
 
@@ -380,14 +382,18 @@ Brevo (production email): `SMTP_HOST=smtp-relay.brevo.com`, `SMTP_PORT=587`, `SM
 
 ## Deployment
 
-`cloudbuild.yaml` builds in **asia-south1** and deploys Cloud Run service **`ai-hackathon-evaluator-backend`** from Artifact Registry repo `ai-hackathon-evaluator-backend`. The container listens on port 8080. The service is `--allow-unauthenticated`; authorization is the application cookie and Bearer check. Memory 1 GiB, 1 CPU, timeout 3600s.
+A push to the Git branch **`production`** is what the Cloud Build trigger should build. `cloudbuild.yaml` runs in **asia-south1** and deploys Cloud Run service **`challazo-backend`** from Artifact Registry repo `challazo-backend`. The same image is also deployed as **`challazo-evaluator`**, which runs AI evaluation jobs (one request per instance, at most four instances). The API enqueues those jobs; the site does not call the evaluator. Both services run as `challazo-backend-deploy@$PROJECT_ID.iam.gserviceaccount.com`. The container listens on port 8080. The API is `--allow-unauthenticated`; authorization is the application cookie and Bearer check. Memory 1 GiB, 1 CPU, timeout 3600s.
+
+`_ALLOWED_ORIGINS` and `_GCS_CORS_ORIGINS` include `https://challazo.in`, `https://www.challazo.in`, and local `localhost` / `127.0.0.1` on ports 3000 and 5173. The storage list is what lets the browser PUT a demo video. When the production hostname changes, keep those local origins.
 
 Cloud Build substitutions (override per trigger):
 
 | Substitution | Default |
 |---|---|
-| `_ALLOWED_ORIGINS` | `https://challazo.nxtlab.tech` |
-| `_GCS_CORS_ORIGINS` | that origin, plus localhost 3000 and 5173 |
+| `_SERVICE_NAME` | `challazo-backend` |
+| `_AR_REPO` | `challazo-backend` |
+| `_ALLOWED_ORIGINS` | `https://challazo.in`, `https://www.challazo.in`, localhost and `127.0.0.1` on ports 3000 and 5173 |
+| `_GCS_CORS_ORIGINS` | same list as `_ALLOWED_ORIGINS` |
 | `_ENVIRONMENT` | `production` |
 | `_SEED_ON_STARTUP` | `false` |
 | `_SMTP_HOST` / `_SMTP_PORT` / `_SMTP_FROM` | Brevo relay, 587, `noreply@mail.challazo.nxtlab.tech` |

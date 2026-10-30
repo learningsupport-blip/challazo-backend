@@ -2,6 +2,8 @@
 Super Admin Application Settings.
 
     GET  /super-admin/settings                         -> settings flags (sidebar page)
+    GET  /super-admin/settings/evaluation-routing      -> video worker shares
+    PUT  /super-admin/settings/evaluation-routing      -> save video worker shares
     GET  /super-admin/settings/registration            -> OTP toggles and waiting counts
     PUT  /super-admin/settings/registration            -> turn email/mobile OTP on or off
     POST /super-admin/settings/registration/release    -> ask the next batch to verify
@@ -27,6 +29,8 @@ from app.models.settings_model import (
     ChangeProfilePasswordRequest,
     DeleteHackathonRequest,
     DeleteHackathonResponse,
+    EvaluationRoutingResponse,
+    EvaluationRoutingUpdate,
     HackathonDeleteListItem,
     HackathonDeletePreview,
     RegistrationConfigUpdate,
@@ -58,6 +62,57 @@ async def get_application_settings(
     _ = super_admin
     payload = await run_sync(service.get_settings_public)
     return AppSettingsResponse(**payload)
+
+
+@router.get("/evaluation-routing", response_model=EvaluationRoutingResponse)
+async def get_evaluation_routing(
+    super_admin: CurrentUser = Depends(get_super_admin_user),
+    service: AppSettingsService = Depends(get_app_settings_service),
+) -> EvaluationRoutingResponse:
+    """
+    Which project runs video AI analysis.
+
+    ``mode`` is ``personal``, ``company``, or ``both``. Shares and ``sequence``
+    apply when both projects are selected. GitHub AI evaluation is not part of
+    this setting.
+    """
+    _ = super_admin
+    payload = await run_sync(service.get_evaluation_routing)
+    return EvaluationRoutingResponse(**payload)
+
+
+@router.put("/evaluation-routing", response_model=EvaluationRoutingResponse)
+async def update_evaluation_routing(
+    request: EvaluationRoutingUpdate,
+    super_admin: CurrentUser = Depends(get_super_admin_user),
+    service: AppSettingsService = Depends(get_app_settings_service),
+) -> EvaluationRoutingResponse:
+    """
+    Save which project runs video AI analysis.
+
+    ``personal`` or ``company`` sends every video to that project. ``both``
+    repeats the shares (4 and 1 sends four personal videos, then one company
+    video). Jobs already queued keep the worker they were given.
+    """
+    try:
+        saved = await run_sync(
+            service.set_evaluation_routing,
+            personal_share=request.personal_share,
+            company_share=request.company_share,
+            mode=request.mode,
+            updated_by=super_admin.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except AppError:
+        raise
+    except Exception as exc:
+        logger.exception("Saving evaluation routing failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save evaluation routing",
+        ) from exc
+    return EvaluationRoutingResponse(**saved)
 
 
 @router.post("/change-profile-password", status_code=200)
@@ -134,7 +189,7 @@ async def get_registration_config(
     super_admin: CurrentUser = Depends(get_super_admin_user),
     service: AppSettingsService = Depends(get_app_settings_service),
 ) -> RegistrationStatusResponse:
-    """Email and mobile OTP flags, plus who is waiting and who was already asked."""
+    """Per-role email and mobile flags, plus who is waiting and who was already asked."""
     _ = super_admin
     status_payload = await run_sync(service.registration_status)
     return RegistrationStatusResponse(**status_payload)
@@ -147,15 +202,16 @@ async def update_registration_config(
     service: AppSettingsService = Depends(get_app_settings_service),
 ) -> RegistrationStatusResponse:
     """
-    Turn email and mobile verification on or off for students and evaluators.
+    Save email and mobile verification for students, evaluators, and Application Access.
 
-    Turning a channel on does not open the login popup. Call release for that.
+    Saving does not open the login popup. Call release for that.
     """
     try:
         saved = await run_sync(
             service.set_registration_config,
-            email_verification_enabled=request.email_verification_enabled,
-            mobile_verification_enabled=request.mobile_verification_enabled,
+            student=request.student.model_dump(),
+            evaluator=request.evaluator.model_dump(),
+            application_access=request.application_access.model_dump(),
             updated_by=super_admin.user_id,
         )
     except AppError:
@@ -176,7 +232,8 @@ async def release_registration_verification(
     service: AppSettingsService = Depends(get_app_settings_service),
 ) -> RegistrationStatusResponse:
     """
-    Ask the next batch of unverified students and evaluators to verify on login.
+    Ask the next batch of unverified students, evaluators, and Application Access
+    accounts to verify on login.
 
     Does not send OTP email. The popup uses the existing verify buttons.
     """

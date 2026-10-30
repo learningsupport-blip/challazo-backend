@@ -999,7 +999,9 @@ async def submit_evaluation_for_review(
     """
     Assigned evaluator submits a completed evaluation to admin for approval.
 
-    Requires AI analysis ``status=completed``. Sets ``review_status=pending_review``.
+    After AI analysis, send manual metrics and optional AI overrides.
+    When AI analysis failed or has not run, send ``manual_evaluation: true``
+    and a score for every rubric field. Sets ``review_status=pending_review``.
     """
     try:
         manual = (
@@ -1007,6 +1009,9 @@ async def submit_evaluation_for_review(
         )
         ai_overrides = (
             [m.model_dump() for m in request.ai_overrides] if request.ai_overrides else None
+        )
+        field_scores = (
+            [m.model_dump() for m in request.field_scores] if request.field_scores else None
         )
         submission = await run_sync(
             service.submit_for_review,
@@ -1017,6 +1022,8 @@ async def submit_evaluation_for_review(
             manual_metrics=manual,
             override_ai_scores=request.override_ai_scores,
             ai_overrides=ai_overrides,
+            manual_evaluation=request.manual_evaluation,
+            field_scores=field_scores,
         )
     except ValueError as e:
         raise _http_from_value_error(e) from e
@@ -1119,9 +1126,10 @@ async def assign_submission_evaluator(
     Used by the per-row Evaluator dropdown on the admin Submissions table.
     Pass ``evaluator_id: null`` to unassign.
 
-    ``reason`` is required when an evaluator is already assigned (reassign or
-    unassign). A missing or blank reason returns 400 ``REASON_REQUIRED``.
-    The first assignment does not need one. Every change is appended to
+    ``reason`` is required only when replacing one evaluator with another.
+    Choosing Unassigned, or the first assignment, does not need one. A missing
+    or blank reason on a person-to-person change returns 400 ``REASON_REQUIRED``.
+    Every change is appended to
     ``assignment_history`` and is not rewritten later.
 
     When the submission's round has auto AI on, analysis is queued only if it

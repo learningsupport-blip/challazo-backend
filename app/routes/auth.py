@@ -71,6 +71,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+async def _set_session_cookie(
+    response: JSONResponse,
+    firebase: FirebaseService,
+    id_token: str,
+) -> None:
+    """Store a one-day session for whichever role just signed in."""
+    try:
+        session_cookie = await run_sync(firebase.create_session_cookie, id_token)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not start the session",
+        ) from exc
+    set_auth_cookie(response, session_cookie)
+
+
 @router.post("/profile/start", response_model=StaffProfileStartResponse, status_code=200)
 async def start_staff_profile(
     payload: StaffProfileStartRequest,
@@ -111,10 +127,11 @@ async def registration_config(
     service: AppSettingsService = Depends(get_app_settings_service),
 ) -> RegistrationConfigResponse:
     """
-    Public flags for the register page.
+    Public flags for register and Application Access profile screens.
 
-    When a channel is false, hide its Verify button. Registration still collects
-    the email and mobile number.
+    Read ``student``, ``evaluator``, or ``application_access``. When a channel
+    is false, hide its Verify button. The form still collects the email and
+    mobile number. The two top-level booleans repeat the student flags.
     """
     config = await run_sync(service.get_registration_config)
     return RegistrationConfigResponse(**config)
@@ -126,7 +143,7 @@ async def start_account_verification(
     verification: VerificationService = Depends(get_verification_service),
 ) -> AccountVerificationStartResponse:
     """
-    Start OTP for a signed-in student or evaluator Super Admin has asked to verify.
+    Start OTP for a signed-in account Super Admin has asked to verify.
 
     ``email_required`` and ``mobile_required`` say which Verify buttons to show.
     """
@@ -211,7 +228,7 @@ async def register_complete(
     Create the student account after every channel Application config requires.
 
     A channel the Super Admin turned off is stored as not yet verified.
-    Issues the same session cookies as POST /auth/login.
+    Issues the same one-day session cookie as POST /auth/login.
     """
     created = await run_sync(verification.complete, payload)
     id_token = await run_sync(
@@ -235,7 +252,7 @@ async def register_complete(
         csrf_token=csrf_token,
     ).model_dump()
     response = JSONResponse(content=body)
-    set_auth_cookie(response, id_token)
+    await _set_session_cookie(response, firebase, id_token)
     set_csrf_cookie(response, token=csrf_token)
     return response
 
@@ -248,7 +265,8 @@ async def register_evaluator_complete(
 ) -> JSONResponse:
     """
     Create the evaluator account after every channel Application config requires.
-    Issues session cookies; ``approval_status`` is ``pending`` until admin approves.
+    Issues the same one-day session cookie as login. ``approval_status`` is
+    ``pending`` until admin approves.
     """
     created = await run_sync(verification.complete_evaluator, payload)
     id_token = await run_sync(
@@ -272,7 +290,7 @@ async def register_evaluator_complete(
         csrf_token=csrf_token,
     ).model_dump()
     response = JSONResponse(content=body)
-    set_auth_cookie(response, id_token)
+    await _set_session_cookie(response, firebase, id_token)
     set_csrf_cookie(response, token=csrf_token)
     return response
 
@@ -350,9 +368,10 @@ async def login(
     """
     Login with email and password.
 
-    On success the Firebase ID token is stored in an HttpOnly cookie (not in
-    the JSON body). ``csrf_token`` is returned in the body for cross-origin
-    SPAs that cannot read the API-domain cookie via ``document.cookie``.
+    On success a one-day Firebase session cookie is stored in an HttpOnly
+    cookie (not in the JSON body). The length is the same for every role.
+    ``csrf_token`` is returned in the body for cross-origin SPAs that cannot
+    read the API-domain cookie via ``document.cookie``.
     """
     try:
         project_id = os.getenv("FIREBASE_PROJECT_ID")
@@ -445,7 +464,7 @@ async def login(
         ).model_dump()
 
         response = JSONResponse(content=payload)
-        set_auth_cookie(response, id_token)
+        await _set_session_cookie(response, firebase, id_token)
         # Phase 5b: double-submit CSRF (cookie + body for cross-origin SPAs).
         set_csrf_cookie(response, token=csrf_token)
         return response

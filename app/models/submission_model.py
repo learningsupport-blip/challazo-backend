@@ -271,6 +271,21 @@ class SubmissionResponse(BaseModel):
             "submission is not already processing."
         ),
     )
+    evaluation_source: Literal["ai", "manual"] = Field(
+        "ai",
+        description=(
+            "manual after an evaluator scored every field by hand. "
+            "ai when the scorecard came from AI analysis."
+        ),
+    )
+    manual_evaluation_allowed: bool = Field(
+        False,
+        description=(
+            "True for staff when AI analysis failed or has not run, the review "
+            "is still open, and this hackathon has a scorecard. The scorecard "
+            "on the response is then an empty copy of that rubric."
+        ),
+    )
     github_ai_evaluation: bool = Field(
         False,
         description=(
@@ -463,6 +478,21 @@ class SubmitForReviewRequest(BaseModel):
         max_length=5000,
         description="Optional notes for the admin reviewing this evaluation.",
     )
+    manual_evaluation: bool = Field(
+        False,
+        description=(
+            "Score every rubric field by hand. Allowed when AI analysis failed "
+            "or has not run. The server computes final_score from field_scores."
+        ),
+    )
+    field_scores: Optional[list[ManualMetricInput]] = Field(
+        None,
+        description=(
+            "One entry per weighted scorecard field. AI fields send "
+            "{field_key, score, rationale?}. Manual fields (GitHub, MVP) send "
+            "the same segments as manual_metrics."
+        ),
+    )
 
     @field_validator("evaluator_notes", mode="before")
     @classmethod
@@ -471,6 +501,14 @@ class SubmitForReviewRequest(BaseModel):
 
     @model_validator(mode="after")
     def require_score_or_manual(self) -> "SubmitForReviewRequest":
+        if self.manual_evaluation:
+            if not self.field_scores:
+                raise ValueError("field_scores is required for a manual evaluation")
+            if self.override_ai_scores or self.ai_overrides:
+                raise ValueError("Omit AI overrides when submitting a manual evaluation")
+            return self
+        if self.field_scores:
+            raise ValueError("field_scores is only used when manual_evaluation is true")
         if self.override_ai_scores:
             if not self.ai_overrides:
                 raise ValueError("ai_overrides is required when override_ai_scores is true")
@@ -575,8 +613,8 @@ class AssignEvaluatorRequest(BaseModel):
         None,
         max_length=500,
         description=(
-            "Required when this submission already has an evaluator. "
-            "Not required for the first assignment."
+            "Required when replacing one evaluator with another. "
+            "Not required for the first assignment or for Unassigned."
         ),
     )
 

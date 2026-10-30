@@ -35,9 +35,7 @@ def _request(
     # Starlette reads cookies from headers; inject via cookie header if needed.
     if cookies:
         cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        scope["headers"] = list(scope["headers"]) + [
-            (b"cookie", cookie_header.encode())
-        ]
+        scope["headers"] = list(scope["headers"]) + [(b"cookie", cookie_header.encode())]
         req = Request(scope)
     return req
 
@@ -100,9 +98,42 @@ def test_enforce_csrf_skipped_for_safe_methods(monkeypatch):
     auth_middleware._enforce_csrf_if_needed(req, used_cookie=True)
 
 
+def test_session_cookie_lasts_one_day():
+    from app.utils.auth_cookies import AUTH_COOKIE_MAX_AGE, CSRF_COOKIE_MAX_AGE
+
+    assert AUTH_COOKIE_MAX_AGE == 86400
+    assert CSRF_COOKIE_MAX_AGE == AUTH_COOKIE_MAX_AGE
+
+
+def test_verify_auth_token_accepts_session_cookie_or_id_token():
+    from firebase_admin import auth as firebase_auth
+
+    from app.services.firebase import FirebaseService
+
+    service = FirebaseService.__new__(FirebaseService)
+    service._auth = MagicMock()
+    service._auth.verify_session_cookie.return_value = {"uid": "session-user"}
+
+    assert service.verify_auth_token("session.jwt.here")["uid"] == "session-user"
+    service._auth.verify_id_token.assert_not_called()
+
+    service._auth.verify_session_cookie.side_effect = firebase_auth.InvalidSessionCookieError(
+        "not a session cookie"
+    )
+    service._auth.verify_id_token.return_value = {"uid": "bearer-user"}
+    assert service.verify_auth_token("id.jwt.here")["uid"] == "bearer-user"
+
+    service._auth.verify_session_cookie.side_effect = firebase_auth.ExpiredSessionCookieError(
+        "expired",
+        None,
+    )
+    with pytest.raises(ValueError, match="Session has expired"):
+        service.verify_auth_token("old.session.cookie")
+
+
 def test_authenticate_token_passes_check_revoked_true():
     firebase = MagicMock()
-    firebase.verify_id_token.return_value = {"uid": "u1"}
+    firebase.verify_auth_token.return_value = {"uid": "u1"}
     user_service = MagicMock()
     user_service.get_user.return_value = {
         "email": "a@b.com",
@@ -124,7 +155,7 @@ def test_authenticate_token_passes_check_revoked_true():
         token = "aaa.bbb.ccc"
         user = auth_middleware._authenticate_token(token)
 
-    firebase.verify_id_token.assert_called_once_with(token, check_revoked=True)
+    firebase.verify_auth_token.assert_called_once_with(token, check_revoked=True)
     assert isinstance(user, CurrentUser)
     assert user.user_id == "u1"
 

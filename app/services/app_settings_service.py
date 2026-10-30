@@ -16,6 +16,19 @@ from google.cloud import storage
 
 from app.models.settings_model import RESET_CONFIRM_PHRASE
 from app.services.email_service import MAIL_COLLECTION
+from app.services.evaluation_routing import (
+    COMPANY_KEY,
+    EVALUATION_ROUTING_DOC_ID,
+    PERSONAL_KEY,
+    WORKER_CATALOG,
+    active_sequence,
+    infer_mode,
+    resolve_mode,
+    routing_summary,
+    shares_from_document,
+    validate_routing_choice,
+    worker_urls,
+)
 from app.services.firebase import FirebaseService
 from app.services.team_service import TEAMS, ENROLLMENTS, JOIN_CODES
 from app.services.verification_service import RATE_LIMITS, SESSIONS
@@ -46,6 +59,8 @@ WIPEABLE_COLLECTIONS: tuple[str, ...] = (
     "ai_evaluation_prompt",
     "submissions",
     "analysis",
+    "external_hackathons",
+    "external_submissions",
     TEAMS,
     ENROLLMENTS,
     JOIN_CODES,
@@ -65,24 +80,105 @@ AI_PROMPT_DOCUMENT_IDS: tuple[str, ...] = ("checklist", "analyze_video")
 SETTINGS_COLLECTION = "app_settings"
 SETTINGS_DOC_ID = "security"
 REGISTRATION_DOC_ID = "registration"
-_REGISTRATION_ROLES = ("student", "evaluator")
+_VERIFICATION_ROLE_KEYS = ("student", "evaluator", "application_access")
+_REGISTRATION_ROLES = ("student", "evaluator", "admin", "custom")
+_BOTH_ON = {
+    "email_verification_enabled": True,
+    "mobile_verification_enabled": True,
+}
 
 
-def verification_due_for(user: dict[str, Any], config: dict[str, bool]) -> dict[str, bool]:
+def role_verification_key(role: str) -> str | None:
+    """Map an account role to the checkbox group that applies to it."""
+    if role == "student":
+        return "student"
+    if role == "evaluator":
+        return "evaluator"
+    if role in ("admin", "custom"):
+        return "application_access"
+    return None
+
+
+def _channel_pair(raw: Any, fallback: dict[str, bool]) -> dict[str, bool]:
+    if not isinstance(raw, dict):
+        return dict(fallback)
+    return {
+        "email_verification_enabled": raw.get("email_verification_enabled", True) is not False,
+        "mobile_verification_enabled": raw.get("mobile_verification_enabled", True) is not False,
+    }
+
+
+def normalize_registration_config(doc: dict[str, Any] | None) -> dict[str, Any]:
+    """Role map, with the old two global switches applied when a role is missing.
+
+    A document saved before per-role checkboxes used ``email_verification_enabled``
+    and ``mobile_verification_enabled`` for students and evaluators together.
+    Those values fill any role block that is not stored yet. A missing document
+    leaves every channel on.
+    """
+    stored = doc or {}
+    if not stored:
+        fallback = dict(_BOTH_ON)
+    else:
+        fallback = {
+            "email_verification_enabled": stored.get("email_verification_enabled", True)
+            is not False,
+            "mobile_verification_enabled": stored.get("mobile_verification_enabled", True)
+            is not False,
+        }
+    student = _channel_pair(stored.get("student"), fallback)
+    evaluator = _channel_pair(stored.get("evaluator"), fallback)
+    application_access = _channel_pair(stored.get("application_access"), fallback)
+    return {
+        "student": student,
+        "evaluator": evaluator,
+        "application_access": application_access,
+        "email_verification_enabled": student["email_verification_enabled"],
+        "mobile_verification_enabled": student["mobile_verification_enabled"],
+    }
+
+
+def channels_for_role(config: dict[str, Any], role: str) -> dict[str, bool]:
+    """Email and mobile flags for this account's role. Unknown roles verify nothing."""
+    normalized = normalize_registration_config(config)
+    key = role_verification_key(role)
+    if key is None:
+        return {
+            "email_verification_enabled": False,
+            "mobile_verification_enabled": False,
+        }
+    block = normalized[key]
+    return {
+        "email_verification_enabled": bool(block["email_verification_enabled"]),
+        "mobile_verification_enabled": bool(block["mobile_verification_enabled"]),
+    }
+
+
+def _any_channel_enabled(config: dict[str, Any]) -> bool:
+    normalized = normalize_registration_config(config)
+    return any(
+        normalized[key]["email_verification_enabled"]
+        or normalized[key]["mobile_verification_enabled"]
+        for key in _VERIFICATION_ROLE_KEYS
+    )
+
+
+def verification_due_for(user: dict[str, Any], config: dict[str, Any]) -> dict[str, bool]:
     """Channels this account must verify on the next login.
 
-    Only students and evaluators Super Admin has released are due. A missing
-    verified flag is treated as already verified so older accounts stay quiet.
+    Students, evaluators, and Application Access accounts (admin and custom)
+    are due only after Super Admin releases them. Each role uses its own
+    checkboxes. A missing verified flag is treated as already verified so
+    older accounts stay quiet.
     """
+    channels = channels_for_role(config, str(user.get("role") or ""))
     if str(user.get("role") or "") not in _REGISTRATION_ROLES:
         return {"email": False, "mobile": False}
     if user.get("verification_required") is not True:
         return {"email": False, "mobile": False}
     return {
-        "email": bool(config.get("email_verification_enabled"))
-        and user.get("email_verified") is False,
-        "mobile": bool(config.get("mobile_verification_enabled"))
-        and user.get("phone_verified") is False,
+        "email": channels["email_verification_enabled"] and user.get("email_verified") is False,
+        "mobile": channels["mobile_verification_enabled"] and user.get("phone_verified") is False,
     }
 
 
@@ -116,31 +212,185 @@ class AppSettingsService:
             "reset_confirm_phrase": RESET_CONFIRM_PHRASE,
         }
 
-    def get_registration_config(self) -> dict[str, bool]:
-        """Email and mobile OTP flags. Missing document means both stay on."""
-        doc = self.firebase.get_document(SETTINGS_COLLECTION, REGISTRATION_DOC_ID) or {}
+    def get_evaluation_routing(self) -> dict[str, Any]:
+        """Shares for the Application Settings video-worker section."""
+        doc = self.firebase.get_document(SETTINGS_COLLECTION, EVALUATION_ROUTING_DOC_ID) or {}
+        return self._routing_payload(doc)
+
+    def set_evaluation_routing(
+        self,
+        *,
+        personal_share: int,
+        company_share: int,
+        updated_by: str,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Save which project runs video AI analysis.
+
+        ``personal`` or ``company`` sends every video there. ``both`` uses the
+        shares. Omitting ``mode`` keeps the previous meaning of the two shares.
+        The next video starts at the beginning of the saved pattern.
+        """
+        urls = worker_urls()
+        chosen = mode or infer_mode(personal_share, company_share)
+        if not chosen:
+            raise ValueError("Choose the personal project, the company project, or both.")
+        validate_routing_choice(
+            chosen,
+            personal_share,
+            company_share,
+            personal_configured=PERSONAL_KEY in urls,
+            company_configured=COMPANY_KEY in urls,
+        )
+
+        now = now_ist_iso()
+        existing = self.firebase.get_document(SETTINGS_COLLECTION, EVALUATION_ROUTING_DOC_ID) or {}
+        self.firebase.set_document(
+            SETTINGS_COLLECTION,
+            EVALUATION_ROUTING_DOC_ID,
+            {
+                "mode": chosen,
+                "personal_share": personal_share,
+                "company_share": company_share,
+                "next_index": 0,
+                "created_at": existing.get("created_at") or now,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+        )
+        return self.get_evaluation_routing()
+
+    def reserve_evaluation_worker(self) -> str:
+        """
+        Take the next slot in the saved pattern.
+
+        The chosen worker is stored on the Cloud Task, so a retry stays there.
+        """
+        urls = worker_urls()
+
+        def _txn(transaction):
+            doc = (
+                self.firebase.txn_get(transaction, SETTINGS_COLLECTION, EVALUATION_ROUTING_DOC_ID)
+                or {}
+            )
+            personal_share, company_share = shares_from_document(
+                doc,
+                company_configured=COMPANY_KEY in urls,
+            )
+            mode = resolve_mode(doc, personal_share, company_share)
+            sequence = active_sequence(
+                mode,
+                personal_share,
+                company_share,
+                personal_configured=PERSONAL_KEY in urls,
+                company_configured=COMPANY_KEY in urls,
+            )
+            if not sequence:
+                raise ValueError("No evaluation service is configured")
+            next_index = doc.get("next_index") or 0
+            try:
+                next_index = int(next_index)
+            except (TypeError, ValueError):
+                next_index = 0
+            if next_index < 0:
+                next_index = 0
+            choice = sequence[next_index % len(sequence)]
+            now = now_ist_iso()
+            self.firebase.txn_set(
+                transaction,
+                SETTINGS_COLLECTION,
+                EVALUATION_ROUTING_DOC_ID,
+                {
+                    "mode": mode,
+                    "personal_share": personal_share,
+                    "company_share": company_share,
+                    "next_index": next_index + 1,
+                    "created_at": doc.get("created_at") or now,
+                    "updated_at": doc.get("updated_at") or now,
+                    "updated_by": doc.get("updated_by") or "",
+                },
+            )
+            return choice
+
+        return self.firebase.run_transaction(_txn)
+
+    def _routing_payload(self, doc: dict[str, Any]) -> dict[str, Any]:
+        urls = worker_urls()
+        personal_share, company_share = shares_from_document(
+            doc,
+            company_configured=COMPANY_KEY in urls,
+        )
+        mode = resolve_mode(doc, personal_share, company_share)
+        sequence = active_sequence(
+            mode,
+            personal_share,
+            company_share,
+            personal_configured=PERSONAL_KEY in urls,
+            company_configured=COMPANY_KEY in urls,
+        )
+        workers = []
+        for item in WORKER_CATALOG:
+            key = item["key"]
+            workers.append(
+                {
+                    "key": key,
+                    "name": item["name"],
+                    "project_id": item["project_id"],
+                    "configured": key in urls,
+                    "share": personal_share if key == PERSONAL_KEY else company_share,
+                    "url": urls.get(key),
+                }
+            )
+        try:
+            next_index = int(doc.get("next_index") or 0)
+        except (TypeError, ValueError):
+            next_index = 0
+        if next_index < 0:
+            next_index = 0
         return {
-            "email_verification_enabled": doc.get("email_verification_enabled", True) is not False,
-            "mobile_verification_enabled": doc.get("mobile_verification_enabled", True)
-            is not False,
+            "mode": mode,
+            "personal_share": personal_share,
+            "company_share": company_share,
+            "next_index": next_index,
+            "sequence": sequence,
+            "summary": routing_summary(sequence),
+            "scope": "Video AI analysis. GitHub AI evaluation stays on this API.",
+            "workers": workers,
         }
+
+    def get_registration_config(self) -> dict[str, Any]:
+        """Per-role email and mobile flags. A missing document leaves every channel on."""
+        doc = self.firebase.get_document(SETTINGS_COLLECTION, REGISTRATION_DOC_ID) or {}
+        return normalize_registration_config(doc)
 
     def set_registration_config(
         self,
         *,
-        email_verification_enabled: bool,
-        mobile_verification_enabled: bool,
+        student: dict[str, bool],
+        evaluator: dict[str, bool],
+        application_access: dict[str, bool],
         updated_by: str,
     ) -> dict[str, Any]:
-        """Save the two toggles. Does not itself ask anyone to verify."""
+        """Save one email and mobile checkbox pair per role.
+
+        Does not itself ask anyone to verify. The two top-level flags are the
+        student pair, kept so an older client reading the document still works.
+        """
         now = now_ist_iso()
         existing = self.firebase.get_document(SETTINGS_COLLECTION, REGISTRATION_DOC_ID) or {}
+        student_pair = _channel_pair(student, _BOTH_ON)
+        evaluator_pair = _channel_pair(evaluator, _BOTH_ON)
+        access_pair = _channel_pair(application_access, _BOTH_ON)
         self.firebase.set_document(
             SETTINGS_COLLECTION,
             REGISTRATION_DOC_ID,
             {
-                "email_verification_enabled": bool(email_verification_enabled),
-                "mobile_verification_enabled": bool(mobile_verification_enabled),
+                "student": student_pair,
+                "evaluator": evaluator_pair,
+                "application_access": access_pair,
+                "email_verification_enabled": student_pair["email_verification_enabled"],
+                "mobile_verification_enabled": student_pair["mobile_verification_enabled"],
                 "created_at": existing.get("created_at") or now,
                 "updated_at": now,
                 "updated_by": updated_by,
@@ -168,7 +418,7 @@ class AppSettingsService:
         if batch_size < 1 or batch_size > 500:
             raise ValueError("batch_size must be between 1 and 500")
         config = self.get_registration_config()
-        if not config["email_verification_enabled"] and not config["mobile_verification_enabled"]:
+        if not _any_channel_enabled(config):
             raise ValueError("Turn email or mobile verification on before sending it to users")
         waiting, released = self._verification_queues(config)
         batch = waiting[:batch_size]
@@ -192,7 +442,7 @@ class AppSettingsService:
         }
 
     def _verification_queues(
-        self, config: dict[str, bool]
+        self, config: dict[str, Any]
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         waiting: list[dict[str, Any]] = []
         released: list[dict[str, Any]] = []
@@ -209,11 +459,12 @@ class AppSettingsService:
         return waiting, released
 
     @staticmethod
-    def _still_needs_verification(user: dict[str, Any], config: dict[str, bool]) -> bool:
+    def _still_needs_verification(user: dict[str, Any], config: dict[str, Any]) -> bool:
         if str(user.get("role") or "") not in _REGISTRATION_ROLES:
             return False
-        email_gap = config["email_verification_enabled"] and user.get("email_verified") is False
-        phone_gap = config["mobile_verification_enabled"] and user.get("phone_verified") is False
+        channels = channels_for_role(config, str(user.get("role") or ""))
+        email_gap = channels["email_verification_enabled"] and user.get("email_verified") is False
+        phone_gap = channels["mobile_verification_enabled"] and user.get("phone_verified") is False
         return email_gap or phone_gap
 
     def ensure_default_profile_password(self) -> None:

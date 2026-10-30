@@ -46,7 +46,7 @@ class StudentRegisterRequest(BaseModel):
     university: str = Field(..., min_length=1, max_length=200)
     team_leader_name: str = Field(..., min_length=1, max_length=100)
     email: EmailStr = Field(..., description="Team leader email (used for login)")
-    niat_id: str = Field(..., min_length=1, max_length=50)
+    niat_id: str = Field(..., min_length=1, description="Any length is accepted.")
     mobile_no: str = Field(..., min_length=10, max_length=15)
     password: str = Field(..., min_length=6)
     confirm_password: str = Field(..., min_length=6)
@@ -332,7 +332,7 @@ class LoginResponse(BaseModel):
     """
     Schema for login response.
 
-    The Firebase ID token is stored in an HttpOnly ``access_token`` cookie.
+    A one-day Firebase session cookie is stored in an HttpOnly ``access_token`` cookie.
     ``csrf_token`` is also returned in the body for cross-origin SPAs (e.g.
     Vercel frontend → Cloud Run API) where ``document.cookie`` cannot read
     API-domain cookies — the SPA must echo it as ``X-CSRF-Token`` on POST/PUT/PATCH/DELETE.

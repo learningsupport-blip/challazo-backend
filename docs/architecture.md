@@ -22,7 +22,7 @@ Students enroll in a published hackathon round (solo or team), submit a demo (vi
 | Long jobs | Cloud Tasks → `POST /internal/jobs/evaluate-submission` (local: FastAPI `BackgroundTasks`) |
 | Timezone | Asia/Kolkata (IST) for dates, windows, and timestamps |
 
-There is **no Postgres**. Firestore is the system of record. Analysis does not use a separate job worker process — Cloud Tasks HTTP-POSTs back into **this** service.
+There is **no Postgres**. Firestore is the system of record. Cloud Tasks delivers AI evaluation to the `challazo-evaluator` Cloud Run service (same image, up to four instances). The public API only enqueues that job. Locally, the same `evaluate_submission` path runs inside this process.
 
 ---
 
@@ -137,6 +137,7 @@ Startup (`lifespan`):
 | `evaluation_requirement` | `/evaluation-requirements` | Rubric / form field definitions |
 | `evaluation_prompt` | `/ai-evaluation-prompts` | Gemini prompt templates |
 | `metric_scoring` | `/ai-evaluation-metric-scoring` | Per-field scoring config |
+| `performance_analysis` | `/admin/analysis` | Hackathon and evaluator performance for the Analysis screen |
 | `internal_jobs` | `/internal/jobs` | Cloud Tasks worker (`X-Internal-Job-Secret`) — not the SPA |
 
 Swagger (`/docs`, `/redoc`, `/openapi.json`) is on in development and off in production unless `ENABLE_API_DOCS=true`.
@@ -272,7 +273,7 @@ Student and evaluator share one registration flow (`VerificationService`). Super
    That college id is unique only within the same university
    (`409 COLLEGE_ID_TAKEN`).
 
-`GET /auth/registration-config` is public. The register page hides Verify for a channel that is off, still calls `register/start`, and `register/complete` stores that channel as `email_verified` / `phone_verified: false` with `verification_required: false`. Turning a channel back on does not popup anyone by itself. `POST /super-admin/settings/registration/release` with `{ "batch_size": 20 }` marks the next oldest waiting students and evaluators (`verification_required: true`). It does not send OTP mail. On the next `POST /auth/login` or `GET /auth/me`, `verification_due.email` / `verification_due.mobile` is true only for a released account that still lacks a channel that is on now. The popup calls `POST /auth/verification/start`, the existing OTP routes, then `POST /auth/verification/complete`. Older accounts with a missing verified flag are treated as already verified.
+`GET /auth/registration-config` is public. It returns a checkbox pair for `student`, `evaluator`, and `application_access` (admin and custom accounts). The two top-level booleans repeat the student pair. The register page reads the pair for the role it is creating, hides Verify for a channel that is off, still collects the email and mobile, and `register/complete` stores that channel as `email_verified` / `phone_verified: false` with `verification_required: false`. Application Access first login (`POST /auth/profile/start` then `/profile/complete`) uses the `application_access` pair the same way. Turning a channel back on does not popup anyone by itself. `PUT /super-admin/settings/registration` saves all three pairs. `POST /super-admin/settings/registration/release` with `{ "batch_size": 20 }` marks the next oldest waiting students, evaluators, and Application Access accounts whose role still has a channel on (`verification_required: true`). It does not send OTP mail. On the next `POST /auth/login` or `GET /auth/me`, `verification_due.email` / `verification_due.mobile` is true only for a released account that still lacks a channel that is on for that role. The popup calls `POST /auth/verification/start`, the existing OTP routes, then `POST /auth/verification/complete`. Older accounts with a missing verified flag are treated as already verified. A registration document saved before per-role checkboxes (only the two top-level booleans) still applies those two values to every role until it is saved again.
 
 OTP rate limits (Firestore `otp_rate_limits`): **5 sends/hour per email**, **2000/hour per IP** (campus NAT), 60s resend cooldown. Codes are hashed (SHA-256 + pepper).
 
@@ -375,9 +376,10 @@ Per **hackathon + round index** (not per hackathon overall):
 - Single (`team_size_mode` `single`, or legacy `max_team_size == 1`): `POST …/enroll/solo`
 - Open (`team_size_mode` `open`): the same solo enroll, or a team of any size. The leader may submit with one or more members.
 - Team: leader `POST …/teams/create` (name + 6-digit join code) → members `POST …/teams/join`
-- `GET …/participation` drives the SPA (`can_submit`, `already_submitted`, `pending_action`, team completeness)
+- `GET …/participation` drives the SPA (`can_submit`, `already_submitted`, `pending_action`, `can_revert`, team completeness)
+- `POST …/enroll/revert` deletes that round's choice and returns participation in the pre-choice state. A solo student, a team member, or a leader who is still alone can call it before anyone on that choice has submitted. A leader who already has teammates gets `409 TEAM_HAS_MEMBERS`. A submission gets `409 ALREADY_SUBMITTED`.
 
-A leftover `role: solo` enrollment on a team round blocks `choose_role` until that enrollment is removed.
+A leftover `role: solo` enrollment on a team round blocks `choose_role` until that enrollment is removed. Revert is how the student removes it.
 
 ### 9.3 Submit once per round
 
@@ -391,6 +393,10 @@ Enforced in `app/services/submission/uniqueness.py` on `POST /submissions` and `
 
 `GET /submissions/admin/hackathons/{id}?page=1&page_size=10` returns one page of that queue (`items`, `total`, `page`, `page_size`, `round_summary`). Optional filters are `round_index`, `status` (`uploaded` | `processing` | `completed` | `failed`), and `q` (team name, theme name, or submission id). `round_summary` counts every round and ignores status and search. `page_size` is at most 100. Omitting `page` still returns the full JSON array.
 
+### Analysis screen
+
+`GET /admin/analysis/options` lists hackathons and evaluators for the filters. `POST /admin/analysis/hackathons` with `hackathon_ids` (1–12) and `top_n` (1–20, the screen offers 3, 5, and 10) returns campus headcount, batch strength, enrollment, submissions, NIAT counts, and project quality. A score of 82 is `rating_10` 8.2. The average uses the latest round that has an approved score, and ties at the cutoff are included. `POST /admin/analysis/evaluators` returns day-wise assigned versus completed counts and hours from `assigned_at` to `submitted_for_review_at`. Admin and Super Admin can call these. A custom role needs the `analysis` permission.
+
 ### 9.4 Video upload and Gemini evaluation
 
 ```mermaid
@@ -399,6 +405,7 @@ sequenceDiagram
   participant API as FastAPI
   participant GCS as GCS
   participant CT as Cloud Tasks
+  participant W as challazo-evaluator
   participant G as Gemini
 
   S->>API: POST /submissions/upload-url
@@ -408,10 +415,10 @@ sequenceDiagram
   API->>API: uniqueness + Firestore submission
   Note over API: Admin assigns evaluator
   API->>CT: enqueue evaluate-submission
-  CT->>API: POST /internal/jobs/evaluate-submission
-  API->>G: gs:// video + rubric / prompts
-  G-->>API: JSON scores + report
-  API->>API: analysis doc + scorecard on submission
+  CT->>W: POST /internal/jobs/evaluate-submission
+  W->>G: gs:// video + rubric / prompts
+  G-->>W: JSON scores + report
+  W->>W: analysis doc + scorecard on submission
 ```
 
 Status on the submission: `uploaded` → `processing` → `completed` | `failed`. The SPA polls `GET /submissions/{id}` (and `/analysis`, `/report` when allowed).
@@ -455,7 +462,7 @@ The SPA never calls the analyser. Manual GitHub scoring still works if the flag 
 | `cloud_tasks` | Explicit, or `auto` when queue + target URL + secret + project are set | Enqueue HTTP task |
 | `background` | Explicit, or `auto` when Cloud Tasks is not configured | FastAPI `BackgroundTasks` |
 
-Worker: `POST /internal/jobs/evaluate-submission` with `X-Internal-Job-Secret`. Non-2xx responses make Cloud Tasks retry (transient Gemini/GCS failures). Invalid secret → 401 (no retry storm of unauthorized tasks if the secret is wrong — Tasks will still retry; keep the secret aligned).
+Worker: `POST /internal/jobs/evaluate-submission` on `challazo-evaluator`, with `X-Internal-Job-Secret`. The queue runs at most four of these at once. Non-2xx responses make Cloud Tasks retry (transient Gemini/GCS failures). Invalid secret → 401 (no retry storm of unauthorized tasks if the secret is wrong — Tasks will still retry; keep the secret aligned).
 
 GitHub AI currently runs as an in-process background task on the evaluate-github-ai request (same 202 + poll pattern), not via Cloud Tasks.
 

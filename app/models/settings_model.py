@@ -2,7 +2,7 @@
 Admin application-settings schemas (profile password + DB reset).
 """
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -71,18 +71,33 @@ class AppSettingsResponse(BaseModel):
     reset_confirm_phrase: str = RESET_CONFIRM_PHRASE
 
 
-class RegistrationConfigResponse(BaseModel):
-    """Which registration checks are on. Applies to students and evaluators."""
+class RoleVerificationSettings(BaseModel):
+    """Email and mobile checks for one kind of account."""
 
     email_verification_enabled: bool = True
     mobile_verification_enabled: bool = True
 
 
-class RegistrationConfigUpdate(BaseModel):
-    """Super Admin toggles for student and evaluator registration."""
+class RegistrationConfigResponse(BaseModel):
+    """Which verification each role must pass.
 
-    email_verification_enabled: bool
-    mobile_verification_enabled: bool
+    ``email_verification_enabled`` and ``mobile_verification_enabled`` repeat the
+    student flags so an older register screen still hides the right buttons.
+    """
+
+    student: RoleVerificationSettings
+    evaluator: RoleVerificationSettings
+    application_access: RoleVerificationSettings
+    email_verification_enabled: bool = True
+    mobile_verification_enabled: bool = True
+
+
+class RegistrationConfigUpdate(BaseModel):
+    """Save the email and mobile checkbox for every role."""
+
+    student: RoleVerificationSettings
+    evaluator: RoleVerificationSettings
+    application_access: RoleVerificationSettings
 
 
 class RegistrationStatusResponse(RegistrationConfigResponse):
@@ -92,8 +107,8 @@ class RegistrationStatusResponse(RegistrationConfigResponse):
         0,
         ge=0,
         description=(
-            "Students and evaluators who still need a required channel "
-            "and have not been asked yet."
+            "Students, evaluators, and Application Access accounts who still "
+            "need a required channel and have not been asked yet."
         ),
     )
     released_count: int = Field(
@@ -109,7 +124,7 @@ class RegistrationStatusResponse(RegistrationConfigResponse):
 
 
 class RegistrationReleaseRequest(BaseModel):
-    """Ask the next batch of unverified students and evaluators to verify on login."""
+    """Ask the next batch of unverified accounts to verify on login."""
 
     batch_size: int = Field(..., ge=1, le=500)
 
@@ -163,3 +178,43 @@ class ResetDatabaseResponse(BaseModel):
     message: str
     deleted_counts: dict[str, int]
     preserved: list[str]
+
+
+class EvaluationWorkerSetting(BaseModel):
+    """One fixed video-evaluation worker the superadmin can give a share of jobs."""
+
+    key: str
+    name: str
+    project_id: str
+    configured: bool
+    share: int = Field(..., ge=0, le=20)
+    url: Optional[str] = None
+
+
+class EvaluationRoutingResponse(BaseModel):
+    """How the next video analyses are divided. GitHub AI is not included."""
+
+    mode: Literal["personal", "company", "both"] = "personal"
+    personal_share: int
+    company_share: int
+    next_index: int = Field(
+        0,
+        description="How many videos have been handed out in the current pattern.",
+    )
+    sequence: list[str]
+    summary: str
+    scope: str
+    workers: list[EvaluationWorkerSetting]
+
+
+class EvaluationRoutingUpdate(BaseModel):
+    """
+    Choose one project, or both.
+
+    Shares are used only when ``mode`` is ``both``. Omit ``mode`` to keep the
+    older meaning: a share of 0 turns that project off.
+    """
+
+    mode: Optional[Literal["personal", "company", "both"]] = None
+    personal_share: int = Field(..., ge=0, le=20)
+    company_share: int = Field(..., ge=0, le=20)

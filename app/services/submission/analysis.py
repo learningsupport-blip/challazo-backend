@@ -5,6 +5,7 @@ from app.utils.time import now_ist_iso
 
 import json
 import logging
+import os
 import re
 from typing import Any
 
@@ -26,6 +27,15 @@ from app.utils.ids import new_id
 
 
 logger = logging.getLogger(__name__)
+
+
+def _retryable_model_error(exc: Exception) -> bool:
+    """Quota and transient Gemini errors should be retried by Cloud Tasks."""
+    code = getattr(exc, "code", None)
+    if code in (429, 500, 502, 503, 504):
+        return True
+    text = str(exc)
+    return "RESOURCE_EXHAUSTED" in text or "UNAVAILABLE" in text
 
 
 class AnalysisMixin:
@@ -234,6 +244,16 @@ class AnalysisMixin:
             logger.info("Analysis %s completed for submission %s", analysis_id, submission_id)
 
         except Exception as e:
+            job_mode = os.getenv("EVALUATION_JOB_MODE", "auto").strip().lower()
+            if _retryable_model_error(e) and job_mode == "cloud_tasks":
+                # Leave the submission in processing. A non-2xx from the worker
+                # makes Cloud Tasks retry instead of storing a permanent failure.
+                logger.warning(
+                    "Retryable analysis error for submission %s: %s",
+                    submission_id,
+                    e,
+                )
+                raise
             logger.error("Analysis failed for submission %s: %s", submission_id, str(e))
             self._commit_analysis_and_submission(
                 analysis_id,

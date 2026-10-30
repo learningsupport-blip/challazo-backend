@@ -1,9 +1,10 @@
-# Environment-specific values are Cloud Build substitutions (override per trigger).
-# Production GCP (master): defaults below.
-# Staging GCP (dev-feature): override in the trigger — see README "Multi-environment deploy".
+# Deployed by a Cloud Build trigger on branch `production` (see README — Deployment).
+# Override production hostnames on the trigger later. Keep every localhost origin.
 substitutions:
-  _ALLOWED_ORIGINS: 'https://challazo.nxtlab.tech'
-  _GCS_CORS_ORIGINS: 'https://challazo.nxtlab.tech,http://localhost:3000,http://localhost:5173'
+  _SERVICE_NAME: 'challazo-backend'
+  _AR_REPO: 'challazo-backend'
+  _ALLOWED_ORIGINS: 'https://challazo.in,https://www.challazo.in,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173'
+  _GCS_CORS_ORIGINS: 'https://challazo.in,https://www.challazo.in,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173'
   _ENVIRONMENT: 'production'
   _SEED_ON_STARTUP: 'false'
   # Brevo SMTP (non-secret). SMTP_USERNAME + SMTP_PASSWORD come from Secret Manager.
@@ -23,23 +24,23 @@ steps:
     entrypoint: bash
     args:
       - '-c'
-      - 'gcloud artifacts repositories describe ai-hackathon-evaluator-backend --location=asia-south1 || gcloud artifacts repositories create ai-hackathon-evaluator-backend --repository-format=docker --location=asia-south1 --description="Docker repository for AI Hackathon Evaluator Backend"'
+      - 'gcloud artifacts repositories describe ${_AR_REPO} --location=asia-south1 || gcloud artifacts repositories create ${_AR_REPO} --repository-format=docker --location=asia-south1 --description="Docker repository for Challazo Backend"'
 
   # Step 2: Build Docker image
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
       - '-t'
-      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/ai-hackathon-evaluator-backend/ai-hackathon-evaluator-backend:$SHORT_SHA'
+      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:$SHORT_SHA'
       - '-t'
-      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/ai-hackathon-evaluator-backend/ai-hackathon-evaluator-backend:latest'
+      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:latest'
       - '.'
 
   # Step 3: Push image to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
-      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/ai-hackathon-evaluator-backend/ai-hackathon-evaluator-backend:$SHORT_SHA'
+      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:$SHORT_SHA'
 
   # Step 4: Ensure submission-video bucket exists (+ CORS for browser PUT uploads)
   # Prefer asia-south1 to colocate with Cloud Run (Phase 8).
@@ -109,6 +110,13 @@ steps:
       - |
         gcloud tasks queues describe evaluation-jobs --location=asia-south1 \
           || gcloud tasks queues create evaluation-jobs --location=asia-south1
+        # Five at a time: four on the Tier 1 worker and one on the company worker.
+        # A 429 stays retryable; the rest of a larger batch waits in this queue.
+        gcloud tasks queues update evaluation-jobs --location=asia-south1 \
+          --max-concurrent-dispatches=5 \
+          --max-dispatches-per-second=1 \
+          --min-backoff=120s \
+          --max-backoff=3600s
 
   # Step 6: Deploy to Cloud Run, then set Cloud Tasks target URL to this revision's URL
   # Prerequisite: Secret Manager secrets must exist (see README):
@@ -120,40 +128,63 @@ steps:
       - '-c'
       - |
         set -euo pipefail
-        gcloud run deploy ai-hackathon-evaluator-backend \
-          --image=asia-south1-docker.pkg.dev/$PROJECT_ID/ai-hackathon-evaluator-backend/ai-hackathon-evaluator-backend:$SHORT_SHA \
+        RUNTIME_SA="challazo-backend-deploy@$PROJECT_ID.iam.gserviceaccount.com"
+        IMAGE="asia-south1-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:$SHORT_SHA"
+        SECRETS="FIREBASE_PROJECT_ID=FIREBASE_PROJECT_ID:latest,FIREBASE_PRIVATE_KEY=FIREBASE_PRIVATE_KEY:latest,FIREBASE_CLIENT_EMAIL=FIREBASE_CLIENT_EMAIL:latest,FIREBASE_WEB_API_KEY=FIREBASE_WEB_API_KEY:latest,INTERNAL_JOB_SECRET=INTERNAL_JOB_SECRET:latest,SMTP_USERNAME=SMTP_USERNAME:latest,SMTP_PASSWORD=SMTP_PASSWORD:latest"
+        # Shared plain env. --set-env-vars replaces every plain env var, so both
+        # services get this full list. CLOUD_TASKS_TARGET_URL is appended only
+        # on the API, and only when a worker URL is already known.
+        ENV_VARS="^|^ENVIRONMENT=${_ENVIRONMENT}|DEBUG=false|EMAIL_PROVIDER=smtp|SMTP_HOST=${_SMTP_HOST}|SMTP_PORT=${_SMTP_PORT}|SMTP_FROM=${_SMTP_FROM}|SMTP_FROM_NAME=Challazo|GOOGLE_CLOUD_PROJECT=$PROJECT_ID|GOOGLE_CLOUD_LOCATION=global|EVALUATION_BUCKET_NAME=$PROJECT_ID-hackathon-evaluations|GEMINI_MODEL=gemini-3.5-flash|GEMINI_ENTERPRISE=true|COOKIE_SAMESITE=none|ALLOWED_ORIGINS=${_ALLOWED_ORIGINS}|EVALUATION_JOB_MODE=cloud_tasks|CLOUD_TASKS_LOCATION=asia-south1|CLOUD_TASKS_QUEUE=evaluation-jobs|CSRF_PROTECTION=true|REQUIRE_CURRENT_PASSWORD_ON_CHANGE=true|SEED_ON_STARTUP=${_SEED_ON_STARTUP}|GITHUB_AI_EVALUATION_URL=${_GITHUB_AI_EVALUATION_URL}|GITHUB_AI_EVALUATION_WAIT_SECONDS=${_GITHUB_AI_EVALUATION_WAIT_SECONDS}|GITHUB_AI_EVALUATION_TIMEOUT_SECONDS=${_GITHUB_AI_EVALUATION_TIMEOUT_SECONDS}|OTP_MAX_SENDS_PER_IP_PER_HOUR=${_OTP_MAX_SENDS_PER_IP_PER_HOUR}|OTP_MAX_SENDS_PER_EMAIL_PER_HOUR=${_OTP_MAX_SENDS_PER_EMAIL_PER_HOUR}"
+
+        # Keep the worker URL already on the API. Evaluation runs in the
+        # Tier 1 project; a later deploy must not point jobs back at this API.
+        CURRENT_TARGET=$$(gcloud run services describe ${_SERVICE_NAME} \
           --region=asia-south1 \
+          --format='value(spec.template.spec.containers[0].env.filter("name:CLOUD_TASKS_TARGET_URL").extract(value).flatten())' \
+          2>/dev/null || true)
+        COMPANY_TARGET=$$(gcloud run services describe ${_SERVICE_NAME} \
+          --region=asia-south1 \
+          --format='value(spec.template.spec.containers[0].env.filter("name:CLOUD_TASKS_COMPANY_TARGET_URL").extract(value).flatten())' \
+          2>/dev/null || true)
+        if [ -z "$$COMPANY_TARGET" ]; then
+          COMPANY_TARGET="https://challazo-evaluator-25vbzbwdva-el.a.run.app/internal/jobs/evaluate-submission"
+        fi
+        TARGET_ENV=""
+        if [ -n "$$CURRENT_TARGET" ]; then
+          TARGET_ENV="|CLOUD_TASKS_TARGET_URL=$$CURRENT_TARGET"
+        fi
+        TARGET_ENV="$${TARGET_ENV}|CLOUD_TASKS_COMPANY_TARGET_URL=$$COMPANY_TARGET"
+
+        gcloud run deploy ${_SERVICE_NAME} \
+          --image="$$IMAGE" \
+          --region=asia-south1 \
+          --service-account="$$RUNTIME_SA" \
           --allow-unauthenticated \
-          --update-secrets=FIREBASE_PROJECT_ID=FIREBASE_PROJECT_ID:latest,FIREBASE_PRIVATE_KEY=FIREBASE_PRIVATE_KEY:latest,FIREBASE_CLIENT_EMAIL=FIREBASE_CLIENT_EMAIL:latest,FIREBASE_WEB_API_KEY=FIREBASE_WEB_API_KEY:latest,INTERNAL_JOB_SECRET=INTERNAL_JOB_SECRET:latest,SMTP_USERNAME=SMTP_USERNAME:latest,SMTP_PASSWORD=SMTP_PASSWORD:latest \
-          --set-env-vars=ENVIRONMENT=${_ENVIRONMENT},DEBUG=false,EMAIL_PROVIDER=smtp,SMTP_HOST=${_SMTP_HOST},SMTP_PORT=${_SMTP_PORT},SMTP_FROM=${_SMTP_FROM},SMTP_FROM_NAME=Challazo,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=global,EVALUATION_BUCKET_NAME=$PROJECT_ID-hackathon-evaluations,GEMINI_MODEL=gemini-3.5-flash,GEMINI_ENTERPRISE=true,COOKIE_SAMESITE=none,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS},EVALUATION_JOB_MODE=cloud_tasks,CLOUD_TASKS_LOCATION=asia-south1,CLOUD_TASKS_QUEUE=evaluation-jobs,CSRF_PROTECTION=true,REQUIRE_CURRENT_PASSWORD_ON_CHANGE=true,SEED_ON_STARTUP=${_SEED_ON_STARTUP},GITHUB_AI_EVALUATION_URL=${_GITHUB_AI_EVALUATION_URL},GITHUB_AI_EVALUATION_WAIT_SECONDS=${_GITHUB_AI_EVALUATION_WAIT_SECONDS},GITHUB_AI_EVALUATION_TIMEOUT_SECONDS=${_GITHUB_AI_EVALUATION_TIMEOUT_SECONDS},OTP_MAX_SENDS_PER_IP_PER_HOUR=${_OTP_MAX_SENDS_PER_IP_PER_HOUR},OTP_MAX_SENDS_PER_EMAIL_PER_HOUR=${_OTP_MAX_SENDS_PER_EMAIL_PER_HOUR} \
+          --update-secrets="$$SECRETS" \
+          --set-env-vars="$${ENV_VARS}$${TARGET_ENV}" \
           --memory=1Gi \
           --cpu=1 \
           --timeout=3600
 
-        SERVICE_URL=$$(gcloud run services describe ai-hackathon-evaluator-backend \
-          --region=asia-south1 --format='value(status.url)')
-        gcloud run services update ai-hackathon-evaluator-backend \
-          --region=asia-south1 \
-          --update-env-vars=CLOUD_TASKS_TARGET_URL=$${SERVICE_URL}/internal/jobs/evaluate-submission
-
-        # Allow the Cloud Run runtime SA to enqueue tasks
-        PROJECT_NUMBER=$$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')
-        RUNTIME_SA=$${PROJECT_NUMBER}-compute@developer.gserviceaccount.com
-        gcloud projects add-iam-policy-binding $PROJECT_ID \
-          --member="serviceAccount:$${RUNTIME_SA}" \
-          --role="roles/cloudtasks.enqueuer" \
-          --condition=None \
-          --quiet || true
+        # Gemini calls run on challazo-evaluator in the Tier 1 project.
+        # This deploy does not create or change that service.
+        # Gemini and Cloud Tasks use this same runtime account.
+        for ROLE in roles/cloudtasks.enqueuer roles/aiplatform.user roles/secretmanager.secretAccessor; do
+          gcloud projects add-iam-policy-binding $PROJECT_ID \
+            --member="serviceAccount:$${RUNTIME_SA}" \
+            --role="$$ROLE" \
+            --condition=None \
+            --quiet || true
+        done
     env:
       - 'CLOUDSDK_COMPUTE_REGION=asia-south1'
 
 images:
-  - 'asia-south1-docker.pkg.dev/$PROJECT_ID/ai-hackathon-evaluator-backend/ai-hackathon-evaluator-backend:$SHORT_SHA'
-  - 'asia-south1-docker.pkg.dev/$PROJECT_ID/ai-hackathon-evaluator-backend/ai-hackathon-evaluator-backend:latest'
+  - 'asia-south1-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:$SHORT_SHA'
+  - 'asia-south1-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE_NAME}:latest'
 
 options:
-  machineType: 'E2_HIGHCPU_8'
-  # Fix for the build error - use Cloud Logging only
+  # Default worker (E2_MEDIUM). E2_HIGHCPU_8 has no quota in asia-south1 for this project.
   logging: CLOUD_LOGGING_ONLY
 
 timeout: '1800s'

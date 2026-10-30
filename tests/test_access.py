@@ -179,6 +179,7 @@ def test_permission_for_path_maps_admin_screens():
     assert permission_for_path("/universities/uni-1") == "university_management"
     assert permission_for_path("/admin/users") == "student_management"
     assert permission_for_path("/admin/overview") == "overview"
+    assert permission_for_path("/admin/analysis/hackathons") == "analysis"
     assert permissions_for_request("/admin/overview", "GET") == frozenset({"overview"})
     assert permission_for_path("/super-admin/settings") == "application_settings"
     assert permission_for_path("/admin/access/roles") is None

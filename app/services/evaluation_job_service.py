@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from fastapi import BackgroundTasks
 
+from app.services.evaluation_routing import worker_urls
 from app.utils.ids import new_id
 
 
@@ -56,7 +57,7 @@ class EvaluationJobService:
         if self.mode_override == "cloud_tasks":
             return "cloud_tasks"
         # auto: use Cloud Tasks only when fully configured
-        if self.queue and self.target_url and self.job_secret and self.project:
+        if self.queue and self.job_secret and self.project and worker_urls():
             return "cloud_tasks"
         return "background"
 
@@ -66,11 +67,30 @@ class EvaluationJobService:
         evaluation_criteria: str | None,
     ) -> str:
         """Create a Cloud Task that POSTs to the internal worker. Returns task name."""
-        task_name = self._enqueue_cloud_task(submission_id, evaluation_criteria)
+        task_name, worker_key = self._enqueue_cloud_task(submission_id, evaluation_criteria)
         logger.info(
-            "Enqueued Cloud Task for submission %s (task=%s)",
+            "Enqueued Cloud Task for submission %s (task=%s, worker=%s)",
             submission_id,
             task_name,
+            worker_key,
+        )
+        return task_name
+
+    def enqueue_external_cloud_task(self, external_submission_id: str) -> str:
+        """Queue Gemini for an external submission. Regular jobs are unchanged."""
+        from app.services.external_evaluation_service import external_job_url
+
+        worker_key, url = self._select_worker_url()
+        task_name, _worker = self._enqueue_http_task(
+            url=external_job_url(url),
+            payload={"external_submission_id": external_submission_id},
+            task_prefix=f"ext-{external_submission_id[:32]}",
+        )
+        logger.info(
+            "Enqueued external Cloud Task for %s (task=%s, worker=%s)",
+            external_submission_id,
+            task_name,
+            worker_key,
         )
         return task_name
 
@@ -158,33 +178,41 @@ class EvaluationJobService:
         self,
         submission_id: str,
         evaluation_criteria: str | None,
-    ) -> str:
-        # Imported lazily so local/dev without the package still loads the app
-        # when running in background mode.
+    ) -> tuple[str, str]:
+        # Task client import stays inside ``_enqueue_http_task`` so local
+        # processes that never queue still load this module.
+        worker_key, url = self._select_worker_url()
+        task_name, _worker = self._enqueue_http_task(
+            url=url,
+            payload={
+                "submission_id": submission_id,
+                "evaluation_criteria": evaluation_criteria,
+            },
+            task_prefix=f"eval-{submission_id[:32]}",
+        )
+        return task_name, worker_key
+
+    def _enqueue_http_task(
+        self,
+        *,
+        url: str,
+        payload: dict[str, Any],
+        task_prefix: str,
+    ) -> tuple[str, str]:
         from google.cloud import tasks_v2
         from google.protobuf import duration_pb2
 
         client = tasks_v2.CloudTasksClient()
         parent = client.queue_path(self.project, self.location, self.queue)
-
-        payload = {
-            "submission_id": submission_id,
-            "evaluation_criteria": evaluation_criteria,
-        }
         body = json.dumps(payload).encode("utf-8")
-
-        # Unique task id per enqueue so re-evaluate after completion is allowed.
-        # Concurrent double-click is still blocked by status=processing → 409.
-        task_id = f"eval-{submission_id[:32]}-{new_id()}"
-
-        # Cloud Tasks max HTTP dispatch deadline is 30 minutes.
+        # Unique task id per enqueue so a later re-evaluate is allowed.
+        task_id = f"{task_prefix}-{new_id()}"
         dispatch_deadline = duration_pb2.Duration(seconds=1800)
-
         task: dict[str, Any] = {
             "name": f"{parent}/tasks/{task_id}",
             "http_request": {
                 "http_method": tasks_v2.HttpMethod.POST,
-                "url": self.target_url,
+                "url": url,
                 "headers": {
                     "Content-Type": "application/json",
                     "X-Internal-Job-Secret": self.job_secret,
@@ -193,6 +221,31 @@ class EvaluationJobService:
             },
             "dispatch_deadline": dispatch_deadline,
         }
-
         created = client.create_task(request={"parent": parent, "task": task})
-        return created.name
+        return created.name, ""
+
+    def _select_worker_url(self) -> tuple[str, str]:
+        """
+        Pick the worker for this video.
+
+        One configured worker keeps the previous behaviour and does not read settings.
+        Two workers follow the superadmin share saved in Application Settings.
+        """
+        urls = worker_urls()
+        if not urls:
+            raise RuntimeError(
+                "CLOUD_TASKS_TARGET_URL is not set, so the evaluation job cannot be queued."
+            )
+        if len(urls) == 1:
+            key, url = next(iter(urls.items()))
+            return key, url
+
+        from app.services.app_settings_service import AppSettingsService
+
+        key = AppSettingsService().reserve_evaluation_worker()
+        url = urls.get(key)
+        if not url:
+            raise RuntimeError(
+                "CLOUD_TASKS_TARGET_URL is not set, so the evaluation job cannot be queued."
+            )
+        return key, url

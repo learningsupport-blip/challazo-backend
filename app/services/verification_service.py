@@ -604,7 +604,7 @@ class VerificationService:
         )
 
         user = self.user_service.get_user(user_id) or {}
-        if str(user.get("role") or "") not in ("student", "evaluator"):
+        if str(user.get("role") or "") not in ("student", "evaluator", "admin", "custom"):
             raise ForbiddenError(
                 "This account does not use registration verification",
                 code="VERIFICATION_NOT_REQUIRED",
@@ -716,8 +716,8 @@ class VerificationService:
     def complete_staff_profile(
         self, user_id: str, request: StaffProfileCompleteRequest
     ) -> dict[str, Any]:
-        """Store employee ID and mobile after both verifications succeed."""
-        self._require_staff_profile(user_id)
+        """Store employee ID and mobile after the channels this role requires."""
+        user = self._require_staff_profile(user_id)
         session = self._load_session(request.session_id)
         self._assert_purpose(session, PURPOSE_STAFF_PROFILE)
         if str(session.get("user_id") or "") != user_id:
@@ -725,13 +725,31 @@ class VerificationService:
                 "This verification session belongs to another account",
                 code="SESSION_INVALID",
             )
-        session_email, session_phone = self._require_verified_identifiers(session)
+        from app.services.app_settings_service import AppSettingsService, channels_for_role
+
+        channels = channels_for_role(
+            AppSettingsService(firebase=self.firebase).get_registration_config(),
+            str(user.get("role") or "admin"),
+        )
+        email_on = channels["email_verification_enabled"]
+        phone_on = channels["mobile_verification_enabled"]
+        if email_on and not session.get("email_verified"):
+            raise ForbiddenError(
+                "Email must be verified before this profile can be saved",
+                code="NOT_VERIFIED",
+            )
+        if phone_on and not session.get("phone_verified"):
+            raise ForbiddenError(
+                "Mobile number must be verified before this profile can be saved",
+                code="NOT_VERIFIED",
+            )
+        session_email = str(session.get("email") or "").strip()
+        session_phone = str(session.get("phone") or "").strip()
         if session_email != request.email or session_phone != request.mobile_number:
             raise ForbiddenError(
                 "Submitted email or mobile does not match verified values",
                 code="IDENTIFIER_MISMATCH",
             )
-        user = self.user_service.get_user(user_id) or {}
         account_email = str(user.get("email") or "").strip().lower()
         if request.email != account_email:
             raise ForbiddenError(
@@ -749,8 +767,8 @@ class VerificationService:
             {
                 "mobile_no": request.mobile_number,
                 "employee_id": employee_id,
-                "email_verified": True,
-                "phone_verified": True,
+                "email_verified": email_on,
+                "phone_verified": phone_on,
                 "profile_completed": True,
             },
         )
@@ -761,8 +779,8 @@ class VerificationService:
             "email": request.email,
             "mobile_no": request.mobile_number,
             "employee_id": employee_id,
-            "email_verified": True,
-            "phone_verified": True,
+            "email_verified": email_on,
+            "phone_verified": phone_on,
         }
 
     def _require_staff_profile(self, user_id: str) -> dict[str, Any]:
@@ -845,11 +863,12 @@ class VerificationService:
 
         A channel that is off is stored as unverified so a later batch can ask.
         """
-        from app.services.app_settings_service import AppSettingsService
+        from app.services.app_settings_service import AppSettingsService, channels_for_role
 
         config = AppSettingsService(firebase=self.firebase).get_registration_config()
-        email_on = bool(config["email_verification_enabled"])
-        phone_on = bool(config["mobile_verification_enabled"])
+        channels = channels_for_role(config, str(session.get("role") or "student"))
+        email_on = channels["email_verification_enabled"]
+        phone_on = channels["mobile_verification_enabled"]
         session_email = str(session.get("email") or "").strip()
         session_phone = str(session.get("phone") or "").strip()
         if email_on:

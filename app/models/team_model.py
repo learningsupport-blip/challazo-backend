@@ -82,6 +82,14 @@ class HackathonParticipationResponse(BaseModel):
     round_status: Literal["draft", "scheduled", "open", "closed"] = "draft"
     round_open: bool = False
     enrolled: bool
+    can_revert: bool = Field(
+        False,
+        description=(
+            "True when this student can undo Solo, team leader, or team member "
+            "and return to the role choice. False after a submission, after the "
+            "round closes, or while a leader still has teammates."
+        ),
+    )
     role: Literal["solo", "leader", "member"] | None = None
     team: HackathonTeamResponse | None = None
     can_submit: bool

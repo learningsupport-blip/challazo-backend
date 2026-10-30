@@ -24,7 +24,7 @@ DEFAULT_DEV_ORIGINS = [
 
 # Fallback when ALLOWED_ORIGINS is not set in production.
 DEFAULT_PROD_ORIGINS = [
-    "https://challazo.nxtlab.tech",
+    "https://challazo.in",
 ]
 
 # Methods used by the SPA against this API (plus OPTIONS preflight / HEAD).

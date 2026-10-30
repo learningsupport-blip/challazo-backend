@@ -245,6 +245,27 @@ def get_evaluation_job_service(request: Request) -> EvaluationJobService:
     return get_container(request).evaluation_job_service
 
 
+def get_external_hackathon_service(request: Request):
+    from app.services.external_hackathon_service import ExternalHackathonService
+
+    container = get_container(request)
+    return ExternalHackathonService(
+        firebase=container.firebase,
+        storage_client=container.storage_client,
+        user_service=container.user_service,
+    )
+
+
+def get_external_evaluation_service(request: Request):
+    from app.services.external_evaluation_service import ExternalEvaluationService
+
+    container = get_container(request)
+    return ExternalEvaluationService(
+        firebase=container.firebase,
+        submission_service=container.submission_service,
+    )
+
+
 def get_app_settings_service(request: Request) -> AppSettingsService:
     return get_container(request).app_settings_service
 

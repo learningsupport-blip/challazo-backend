@@ -60,9 +60,7 @@ class FirebaseService:
                     if not value
                 ]
                 if missing:
-                    raise ValueError(
-                        "Missing Firebase configuration: " + ", ".join(missing)
-                    )
+                    raise ValueError("Missing Firebase configuration: " + ", ".join(missing))
 
                 # Parse and use credentials
                 cred_dict = {
@@ -88,9 +86,7 @@ class FirebaseService:
 
     # ==================== Authentication Methods ====================
 
-    def create_user(
-        self, email: str, password: str, display_name: str = ""
-    ) -> dict[str, Any]:
+    def create_user(self, email: str, password: str, display_name: str = "") -> dict[str, Any]:
         """
         Create a new Firebase user
 
@@ -103,9 +99,7 @@ class FirebaseService:
             Dictionary with user_id and additional info
         """
         try:
-            user = self._auth.create_user(
-                email=email, password=password, display_name=display_name
-            )
+            user = self._auth.create_user(email=email, password=password, display_name=display_name)
             logger.info(f"User created successfully: {user.uid}")
             return {"user_id": user.uid, "email": user.email}
         except auth.EmailAlreadyExistsError:
@@ -153,9 +147,7 @@ class FirebaseService:
             return results
         except Exception as e:
             logger.exception("Firebase Auth list_users failed")
-            raise InfrastructureError(
-                "Firebase Auth is temporarily unavailable"
-            ) from e
+            raise InfrastructureError("Firebase Auth is temporarily unavailable") from e
 
     def update_display_name(self, user_id: str, display_name: str) -> bool:
         """Keep the Firebase Auth display name in step with the Firestore profile."""
@@ -196,9 +188,42 @@ class FirebaseService:
             logger.error(f"Error updating password for user {user_id}: {str(e)}")
             raise Exception(f"Error updating password: {str(e)}")
 
-    def verify_id_token(
-        self, token: str, check_revoked: bool = True
-    ) -> dict[str, Any]:
+    def create_session_cookie(self, id_token: str) -> str:
+        """Exchange a fresh ID token for a session cookie that lasts one day."""
+        from datetime import timedelta
+
+        from app.utils.auth_cookies import AUTH_COOKIE_MAX_AGE
+
+        try:
+            cookie = self._auth.create_session_cookie(
+                id_token,
+                expires_in=timedelta(seconds=AUTH_COOKIE_MAX_AGE),
+            )
+        except Exception as e:
+            logger.exception("Could not create a session cookie")
+            raise ValueError("Could not start the session") from e
+        if not cookie:
+            raise ValueError("Could not start the session")
+        return cookie
+
+    def verify_auth_token(self, token: str, check_revoked: bool = True) -> dict[str, Any]:
+        """
+        Accept a one-day session cookie, or a Bearer ID token.
+
+        Swagger still sends the one-hour ID token. The website cookie is the
+        session cookie. An expired session does not fall through to the ID
+        token check.
+        """
+        try:
+            return self._auth.verify_session_cookie(token, check_revoked=check_revoked)
+        except auth.ExpiredSessionCookieError as e:
+            raise ValueError("Session has expired") from e
+        except auth.RevokedSessionCookieError as e:
+            raise ValueError("Session has been revoked") from e
+        except auth.InvalidSessionCookieError:
+            return self.verify_id_token(token, check_revoked=check_revoked)
+
+    def verify_id_token(self, token: str, check_revoked: bool = True) -> dict[str, Any]:
         """
         Verify Firebase ID token.
 
@@ -206,9 +231,7 @@ class FirebaseService:
         change / admin revoke so stolen cookies stop working sooner.
         """
         try:
-            decoded_token = self._auth.verify_id_token(
-                token, check_revoked=check_revoked
-            )
+            decoded_token = self._auth.verify_id_token(token, check_revoked=check_revoked)
             return decoded_token
         except auth.InvalidIdTokenError:
             raise ValueError("Invalid ID token")
@@ -320,9 +343,7 @@ class FirebaseService:
 
     # ==================== Firestore Methods ====================
 
-    def set_document(
-        self, collection: str, document_id: str, data: dict[str, Any]
-    ) -> bool:
+    def set_document(self, collection: str, document_id: str, data: dict[str, Any]) -> bool:
         """
         Set a document in Firestore
 
@@ -340,9 +361,7 @@ class FirebaseService:
             return True
         except Exception as e:
             logger.exception("Error setting document %s/%s", collection, document_id)
-            raise InfrastructureError(
-                f"Failed to write document {collection}/{document_id}"
-            ) from e
+            raise InfrastructureError(f"Failed to write document {collection}/{document_id}") from e
 
     def get_document(self, collection: str, document_id: str) -> Optional[dict[str, Any]]:
         """
@@ -356,13 +375,9 @@ class FirebaseService:
             return doc.to_dict() if doc.exists else None
         except Exception as e:
             logger.exception("Error getting document %s/%s", collection, document_id)
-            raise InfrastructureError(
-                f"Failed to read document {collection}/{document_id}"
-            ) from e
+            raise InfrastructureError(f"Failed to read document {collection}/{document_id}") from e
 
-    def update_document(
-        self, collection: str, document_id: str, data: dict[str, Any]
-    ) -> bool:
+    def update_document(self, collection: str, document_id: str, data: dict[str, Any]) -> bool:
         """
         Update a document in Firestore
 
@@ -440,13 +455,9 @@ class FirebaseService:
             raise
         except Exception as e:
             logger.exception("Error bulk-deleting from %s", collection)
-            raise InfrastructureError(
-                f"Failed to bulk-delete collection {collection}"
-            ) from e
+            raise InfrastructureError(f"Failed to bulk-delete collection {collection}") from e
 
-    def get_documents(
-        self, collection: str, document_ids: list[str]
-    ) -> dict[str, dict[str, Any]]:
+    def get_documents(self, collection: str, document_ids: list[str]) -> dict[str, dict[str, Any]]:
         """
         Batch-get documents by id (Phase 7).
 
@@ -458,10 +469,7 @@ class FirebaseService:
             return {}
 
         try:
-            refs = [
-                self._db.collection(collection).document(doc_id)
-                for doc_id in unique_ids
-            ]
+            refs = [self._db.collection(collection).document(doc_id) for doc_id in unique_ids]
             results: dict[str, dict[str, Any]] = {}
             for snapshot in self._db.get_all(refs):
                 if snapshot.exists:
@@ -469,9 +477,7 @@ class FirebaseService:
             return results
         except Exception as e:
             logger.exception("Error batch-getting documents from %s", collection)
-            raise InfrastructureError(
-                f"Failed to batch-read collection {collection}"
-            ) from e
+            raise InfrastructureError(f"Failed to batch-read collection {collection}") from e
 
     def get_collection(self, collection: str) -> list[dict[str, Any]]:
         """
@@ -485,9 +491,7 @@ class FirebaseService:
             return [{"id": doc.id, **doc.to_dict()} for doc in docs]
         except Exception as e:
             logger.exception("Error getting collection %s", collection)
-            raise InfrastructureError(
-                f"Failed to list collection {collection}"
-            ) from e
+            raise InfrastructureError(f"Failed to list collection {collection}") from e
 
     def query_collection(
         self, collection: str, field: str, operator: str, value: Any
@@ -512,9 +516,7 @@ class FirebaseService:
             logger.exception(
                 "Error querying collection %s (%s %s ...)", collection, field, operator
             )
-            raise InfrastructureError(
-                f"Failed to query collection {collection}"
-            ) from e
+            raise InfrastructureError(f"Failed to query collection {collection}") from e
 
     def batch_write(self, operations: list[dict[str, Any]]) -> bool:
         """
@@ -579,9 +581,7 @@ class FirebaseService:
             logger.exception("Firestore transaction failed")
             raise InfrastructureError("Firestore transaction failed") from e
 
-    def txn_get(
-        self, transaction, collection: str, document_id: str
-    ) -> Optional[dict[str, Any]]:
+    def txn_get(self, transaction, collection: str, document_id: str) -> Optional[dict[str, Any]]:
         """Read a document inside an open transaction."""
         ref = self._db.collection(collection).document(document_id)
         snapshot = ref.get(transaction=transaction)

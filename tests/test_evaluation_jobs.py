@@ -69,6 +69,29 @@ def test_process_skips_already_completed():
     mock_service.evaluate_submission.assert_not_called()
 
 
+def test_retryable_model_error_covers_quota_not_validation():
+    from app.services.submission.analysis import _retryable_model_error
+
+    class Quota(Exception):
+        code = 429
+
+    assert _retryable_model_error(Quota("RESOURCE_EXHAUSTED")) is True
+    assert _retryable_model_error(ValueError("missing video")) is False
+
+
+def test_enqueue_cloud_task_refuses_blank_worker_url(monkeypatch):
+    monkeypatch.setenv("EVALUATION_JOB_MODE", "cloud_tasks")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "demo-proj")
+    monkeypatch.setenv("CLOUD_TASKS_QUEUE", "evaluation-jobs")
+    monkeypatch.setenv("CLOUD_TASKS_TARGET_URL", "")
+    monkeypatch.delenv("CLOUD_TASKS_PERSONAL_TARGET_URL", raising=False)
+    monkeypatch.delenv("CLOUD_TASKS_COMPANY_TARGET_URL", raising=False)
+    monkeypatch.setenv("INTERNAL_JOB_SECRET", "secret-value")
+    jobs = EvaluationJobService()
+    with pytest.raises(RuntimeError, match="CLOUD_TASKS_TARGET_URL"):
+        jobs.enqueue_cloud_task("sub-1", None)
+
+
 def test_enqueue_background_schedules_task(monkeypatch):
     monkeypatch.setenv("EVALUATION_JOB_MODE", "background")
     jobs = EvaluationJobService()

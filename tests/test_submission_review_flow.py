@@ -239,3 +239,203 @@ def test_request_changes_unpublishes(service: SubmissionService):
     payload = service.firebase.txn_update.call_args[0][3]
     assert payload["review_status"] == "changes_requested"
     assert payload["report_published"] is False
+
+
+def _manual_field_scores() -> list[dict]:
+    return [
+        {"field_key": "problem_statement", "score": 15, "rationale": "Clear problem"},
+        {"field_key": "solution_description", "score": 0},
+        {"field_key": "video_explanation", "score": 10},
+        {
+            "field_key": "github_link",
+            "segments": [
+                {"key": "visibility", "value": "public"},
+                {"key": "structure_score", "score": 0},
+            ],
+        },
+        {
+            "field_key": "mvp_link",
+            "segments": [
+                {"key": "authentication", "value": False},
+                {"key": "data_persistence", "value": False},
+                {"key": "realtime_data", "value": False},
+                {"key": "ai_features", "value": False},
+                {"key": "mobile_responsive", "value": False},
+                {"key": "ui_quality", "value": False},
+            ],
+        },
+    ]
+
+
+def _wire_scorecard(service: SubmissionService) -> None:
+    from tests.test_scorecard import SAMPLE_METRICS
+
+    service.hackathon_service.get_hackathon.return_value = {
+        "id": "hack-1",
+        "timeline": [{"evaluation_requirement_id": "req-1"}],
+    }
+    service.metric_scoring_service.get_scoring_for_requirement.return_value = {
+        "metrics": SAMPLE_METRICS,
+    }
+
+
+def test_manual_evaluation_after_ai_failure_scores_every_field(service: SubmissionService):
+    base = make_submission_doc(status="failed", review_status="none")
+    _wire_reads(service, _doc_without_id(base), {"status": "failed", "error": "permission denied"})
+    _wire_scorecard(service)
+
+    result = service.submit_for_review(
+        submission_id="sub-1",
+        evaluator_user_id="evaluator-1",
+        manual_evaluation=True,
+        field_scores=_manual_field_scores(),
+        evaluator_notes="Scored from the video",
+    )
+
+    updates = service.firebase.txn_update.call_args_list
+    analysis_update = updates[0][0][3]
+    submission_update = updates[1][0][3]
+    assert analysis_update["status"] == "completed"
+    assert analysis_update["evaluation_source"] == "manual"
+    assert submission_update["status"] == "completed"
+    assert submission_update["evaluation_source"] == "manual"
+    assert submission_update["review_status"] == "pending_review"
+    assert submission_update["final_score"] == 25.0
+    assert submission_update["error"] is None
+    problem = next(
+        item
+        for item in submission_update["scorecard"]["metrics"]
+        if item["field_key"] == "problem_statement"
+    )
+    assert problem["source"] == "evaluator"
+    assert problem["score"] == 15
+    assert result["evaluation_source"] == "manual"
+
+
+def test_manual_evaluation_creates_analysis_when_ai_never_ran(service: SubmissionService):
+    base = make_submission_doc(status="uploaded", analysis_id=None)
+    _wire_reads(service, _doc_without_id(base), None)
+    _wire_scorecard(service)
+
+    service.submit_for_review(
+        submission_id="sub-1",
+        evaluator_user_id="evaluator-1",
+        manual_evaluation=True,
+        field_scores=_manual_field_scores(),
+    )
+
+    service.firebase.txn_set.assert_called_once()
+    analysis_doc = service.firebase.txn_set.call_args[0][3]
+    assert analysis_doc["status"] == "completed"
+    assert analysis_doc["evaluation_source"] == "manual"
+    submission_update = service.firebase.txn_update.call_args[0][3]
+    assert submission_update["analysis_id"]
+    assert submission_update["status"] == "completed"
+
+
+def test_manual_evaluation_requires_every_field(service: SubmissionService):
+    base = make_submission_doc(status="failed")
+    _wire_reads(service, _doc_without_id(base), {"status": "failed"})
+    _wire_scorecard(service)
+    scores = _manual_field_scores()
+    scores.pop(2)
+
+    with pytest.raises(ValueError, match="video_explanation"):
+        service.submit_for_review(
+            "sub-1",
+            "evaluator-1",
+            manual_evaluation=True,
+            field_scores=scores,
+        )
+
+
+def test_manual_evaluation_rejects_a_score_above_the_field_max(service: SubmissionService):
+    base = make_submission_doc(status="failed")
+    _wire_reads(service, _doc_without_id(base), {"status": "failed"})
+    _wire_scorecard(service)
+    scores = _manual_field_scores()
+    scores[0]["score"] = 16
+
+    with pytest.raises(ValueError, match="between 0 and 15"):
+        service.submit_for_review(
+            "sub-1",
+            "evaluator-1",
+            manual_evaluation=True,
+            field_scores=scores,
+        )
+
+
+def test_manual_evaluation_rejects_a_finished_ai_analysis(service: SubmissionService):
+    base = make_submission_doc(status="completed")
+    _wire_reads(service, _doc_without_id(base), {"status": "completed"})
+    with pytest.raises(ValueError, match="already finished"):
+        service.submit_for_review(
+            "sub-1",
+            "evaluator-1",
+            manual_evaluation=True,
+            field_scores=_manual_field_scores(),
+        )
+
+
+def test_failed_submission_response_includes_an_empty_scorecard():
+    from app.models.user_model import CurrentUser
+    from app.services.submission.query import QueryMixin
+    from tests.test_scorecard import SAMPLE_METRICS
+
+    class Host(QueryMixin):
+        def __init__(self):
+            self.hackathon_service = MagicMock()
+            self.theme_service = MagicMock()
+            self.user_service = MagicMock()
+            self.firebase = MagicMock()
+            self.analysis_collection = "analysis"
+
+        def student_can_view_report(self, submission):
+            return False
+
+        def _storage_client(self):
+            return MagicMock()
+
+        def _load_scoring_config(self, hackathon):
+            return {"metrics": SAMPLE_METRICS}, SAMPLE_METRICS
+
+    host = Host()
+    host.hackathon_service.get_hackathon.return_value = {"id": "hack-1", "name": "Hack"}
+    evaluator = CurrentUser(
+        user_id="evaluator-1",
+        email="e@x.com",
+        role="evaluator",
+        name="Evaluator",
+        approval_status="approved",
+    )
+    enriched = host.enrich_submission_for_response(
+        {
+            "id": "sub-1",
+            "student_id": "student-1",
+            "hackathon_id": "hack-1",
+            "hackathon_name": "Hack",
+            "team_name": "Team",
+            "theme_id": "theme-1",
+            "theme_name": "Theme",
+            "problem_statement": "Problem",
+            "solution_description": "Solution",
+            "status": "failed",
+            "error": "permission denied",
+            "review_status": "none",
+            "assigned_evaluator_id": "evaluator-1",
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+        },
+        current_user=evaluator,
+    )
+    assert enriched["manual_evaluation_allowed"] is True
+    assert enriched["evaluation_source"] == "ai"
+    keys = [item["field_key"] for item in enriched["scorecard"]["metrics"]]
+    assert keys == [
+        "problem_statement",
+        "solution_description",
+        "video_explanation",
+        "github_link",
+        "mvp_link",
+    ]
+    assert all(item["score"] is None for item in enriched["scorecard"]["metrics"])

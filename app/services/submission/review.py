@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.utils.ids import new_id
 from app.utils.time import now_ist_iso
 
 from app.services.scorecard import (
     apply_ai_overrides,
+    apply_evaluator_field_scores,
     apply_manual_scores,
     build_scorecard_skeleton,
 )
@@ -23,6 +25,8 @@ class ReviewMixin:
         manual_metrics: list[dict[str, Any]] | None = None,
         override_ai_scores: bool = False,
         ai_overrides: list[dict[str, Any]] | None = None,
+        manual_evaluation: bool = False,
+        field_scores: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Assigned evaluator submits completed evaluation to admin."""
         notes = evaluator_notes.strip() if evaluator_notes else None
@@ -33,6 +37,11 @@ class ReviewMixin:
         override_payloads = [
             m if isinstance(m, dict) else m.model_dump() for m in (ai_overrides or [])
         ]
+        field_payloads = [
+            m if isinstance(m, dict) else m.model_dump() for m in (field_scores or [])
+        ]
+        if manual_evaluation and not field_payloads:
+            raise ValueError("field_scores is required for a manual evaluation")
         if override_ai_scores and not override_payloads:
             raise ValueError("ai_overrides is required when override_ai_scores is true")
         if not override_ai_scores:
@@ -44,6 +53,16 @@ class ReviewMixin:
                 raise ValueError("Submission not found")
             if submission.get("assigned_evaluator_id") != evaluator_user_id:
                 raise ValueError("Only the assigned evaluator can submit this evaluation")
+            if manual_evaluation:
+                return self._submit_manual_evaluation(
+                    transaction,
+                    submission_id=submission_id,
+                    submission=submission,
+                    evaluator_user_id=evaluator_user_id,
+                    notes=notes,
+                    field_payloads=field_payloads,
+                    now=now,
+                )
             if submission.get("status") != "completed":
                 raise ValueError("AI analysis must be completed before submitting for review")
 
@@ -109,6 +128,140 @@ class ReviewMixin:
 
         return self.firebase.run_transaction(_txn)
 
+    def _submit_manual_evaluation(
+        self,
+        transaction: Any,
+        *,
+        submission_id: str,
+        submission: dict[str, Any],
+        evaluator_user_id: str,
+        notes: str | None,
+        field_payloads: list[dict[str, Any]],
+        now: str,
+    ) -> dict[str, Any]:
+        """Score every rubric field when AI analysis failed or has not run."""
+        status = submission.get("status")
+        if status == "processing":
+            raise ValueError("AI analysis is still running")
+        if status == "completed":
+            raise ValueError(
+                "AI analysis already finished. Submit manual metrics, or override the AI scores."
+            )
+        if status not in ("failed", "uploaded"):
+            raise ValueError("Manual evaluation is available when AI analysis has not completed")
+
+        review_status = submission.get("review_status") or "none"
+        if review_status == "pending_review":
+            raise ValueError("Evaluation is already pending admin review")
+        if review_status == "approved":
+            raise ValueError("Evaluation is already approved; unpublish/request changes first")
+
+        metric_defs = self._metric_defs_for_submission(submission)
+        if not metric_defs:
+            raise ValueError(
+                "No scorecard definition found for this hackathon. "
+                "Configure AI evaluation metric scoring first."
+            )
+        scorecard = apply_evaluator_field_scores(
+            build_scorecard_skeleton(metric_defs),
+            field_payloads,
+            metric_defs=metric_defs,
+        )
+        computed = scorecard.get("computed_total")
+        if computed is None:
+            raise ValueError("Could not compute final_score from field_scores")
+        resolved_score = float(computed)
+        if resolved_score < 0 or resolved_score > 100:
+            raise ValueError("final_score must be between 0 and 100")
+
+        report = notes or "Scored manually by the evaluator."
+        field_rows = [
+            {
+                "field_key": item.get("field_key"),
+                "score": item.get("score"),
+                "max_score": item.get("max_score"),
+                "rationale": item.get("rationale"),
+                "skipped": False,
+            }
+            for item in scorecard.get("metrics") or []
+        ]
+        analysis_id = submission.get("analysis_id")
+        analysis_fields = {
+            "status": "completed",
+            "report": report,
+            "field_scores": field_rows,
+            "scorecard": scorecard,
+            "analyzed_at": now,
+            "error": None,
+            "updated_at": now,
+            "evaluation_source": "manual",
+        }
+        if analysis_id and self.firebase.txn_get(
+            transaction, self.analysis_collection, analysis_id
+        ):
+            self.firebase.txn_update(
+                transaction,
+                self.analysis_collection,
+                analysis_id,
+                analysis_fields,
+            )
+        else:
+            analysis_id = new_id()
+            self.firebase.txn_set(
+                transaction,
+                self.analysis_collection,
+                analysis_id,
+                {
+                    "submission_id": submission_id,
+                    "student_id": submission.get("student_id"),
+                    "evaluation_criteria": None,
+                    "checklist": None,
+                    "created_at": now,
+                    **analysis_fields,
+                },
+            )
+
+        update = {
+            "status": "completed",
+            "error": None,
+            "analysis_id": analysis_id,
+            "evaluation_source": "manual",
+            "review_status": "pending_review",
+            "final_score": resolved_score,
+            "scorecard": scorecard,
+            "manual_scores": field_payloads,
+            "override_ai_scores": False,
+            "evaluator_ai_overrides": None,
+            "evaluator_notes": notes,
+            "submitted_for_review_at": now,
+            "submitted_for_review_by": evaluator_user_id,
+            "report_published": False,
+            "published_at": None,
+            "published_by": None,
+            "reviewed_at": None,
+            "reviewed_by": None,
+            "review_notes": None,
+            "updated_at": now,
+        }
+        self.firebase.txn_update(transaction, self.collection, submission_id, update)
+        return {"id": submission_id, **submission, **update}
+
+    def _metric_defs_for_submission(self, submission: dict[str, Any]) -> list[dict[str, Any]]:
+        hackathon_id = (submission.get("hackathon_id") or "").strip()
+        if not hackathon_id:
+            return []
+        hackathon = self.hackathon_service.get_hackathon(hackathon_id)
+        requirement_id = self._resolve_evaluation_requirement_id(hackathon)
+        if not requirement_id:
+            return []
+        scoring_svc = getattr(self, "metric_scoring_service", None)
+        if scoring_svc is None:
+            return []
+        scoring = scoring_svc.get_scoring_for_requirement(requirement_id)
+        if not scoring:
+            return []
+        return list(scoring.get("metrics") or [])
+
     def _merge_review_into_scorecard(
         self,
         *,
@@ -123,19 +276,8 @@ class ReviewMixin:
         Returns ``(scorecard, computed_total, override_audit)``.
         """
         scorecard = analysis.get("scorecard") or submission.get("scorecard")
-        metric_defs: list[dict[str, Any]] = []
         override_audit: list[dict[str, Any]] = []
-
-        hackathon_id = (submission.get("hackathon_id") or "").strip()
-        if hackathon_id:
-            hackathon = self.hackathon_service.get_hackathon(hackathon_id)
-            requirement_id = self._resolve_evaluation_requirement_id(hackathon)
-            if requirement_id:
-                scoring_svc = getattr(self, "metric_scoring_service", None)
-                if scoring_svc is not None:
-                    scoring = scoring_svc.get_scoring_for_requirement(requirement_id)
-                    if scoring:
-                        metric_defs = list(scoring.get("metrics") or [])
+        metric_defs = self._metric_defs_for_submission(submission)
 
         if not scorecard and metric_defs:
             scorecard = build_scorecard_skeleton(metric_defs)

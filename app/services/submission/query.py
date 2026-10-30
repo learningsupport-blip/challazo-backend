@@ -11,6 +11,7 @@ from app.utils.gcs_video import (
     generate_signed_video_url,
     parse_gs_uri,
 )
+from app.services.scorecard import build_scorecard_skeleton
 from app.services.submission.analysis import AnalysisMixin
 from app.utils.hackathon_round import (
     round_leaderboard_published,
@@ -425,6 +426,7 @@ class QueryMixin:
         hackathon_by_id: dict[str, dict[str, Any]] | None = None,
         storage_client: Any | None = None,
         check_video_exists: bool = False,
+        scorecard_cache: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Attach a browser-playable HTTPS URL alongside the internal gs:// path."""
         enriched = dict(submission)
@@ -451,6 +453,9 @@ class QueryMixin:
         enriched.setdefault("field_answers", None)
         enriched.setdefault("scorecard", None)
         enriched.setdefault("manual_scores", None)
+        enriched.setdefault("evaluation_source", "ai")
+        if enriched.get("evaluation_source") not in ("ai", "manual"):
+            enriched["evaluation_source"] = "ai"
 
         # Backfill hackathon fields for older submissions that predate the link.
         if not enriched.get("hackathon_id"):
@@ -585,6 +590,21 @@ class QueryMixin:
             enriched["github_ai_result"] = None
             enriched["github_ai_error"] = None
 
+        review_status = enriched.get("review_status") or "none"
+        enriched["manual_evaluation_allowed"] = False
+        if (
+            is_staff
+            and enriched.get("status") in ("failed", "uploaded")
+            and review_status in ("none", "changes_requested")
+        ):
+            if not enriched.get("scorecard"):
+                blank = self._blank_scorecard(hackathon, scorecard_cache)
+                if blank:
+                    enriched["scorecard"] = blank
+                    enriched["manual_evaluation_allowed"] = True
+            else:
+                enriched["manual_evaluation_allowed"] = True
+
         round_index = submission_round_index(enriched)
         published_board = round_leaderboard_published(hackathon or {}, round_index)
         enriched["leaderboard_published"] = published_board
@@ -592,6 +612,27 @@ class QueryMixin:
         enriched.setdefault("leaderboard_rank_label", None)
 
         return enriched
+
+    def _blank_scorecard(
+        self,
+        hackathon: dict[str, Any] | None,
+        cache: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Empty rubric so an evaluator can score every field without an AI report."""
+        if not isinstance(hackathon, dict):
+            return None
+        key = str(hackathon.get("id") or "")
+        if cache is not None and key in cache:
+            return cache[key]
+        skeleton = None
+        loader = getattr(self, "_load_scoring_config", None)
+        if callable(loader):
+            _scoring, metrics = loader(hackathon)
+            if metrics:
+                skeleton = build_scorecard_skeleton(metrics)
+        if cache is not None and key:
+            cache[key] = skeleton
+        return skeleton
 
     def attach_leaderboard_rank(
         self,
@@ -656,6 +697,7 @@ class QueryMixin:
             if hackathon:
                 hackathon_by_id[hid] = hackathon
 
+        scorecard_cache: dict[str, Any] = {}
         return [
             self.enrich_submission_for_response(
                 submission,
@@ -664,6 +706,7 @@ class QueryMixin:
                 hackathon_by_id=hackathon_by_id,
                 storage_client=storage_client,
                 check_video_exists=False,
+                scorecard_cache=scorecard_cache,
             )
             for submission in submissions
         ]

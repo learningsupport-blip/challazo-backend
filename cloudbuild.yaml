@@ -88,18 +88,17 @@ steps:
             --uniform-bucket-level-access
           echo "Created $$BUCKET in $$DESIRED_LOCATION"
         fi
-        python3 -c "
-        import json, os
-        origins = [o.strip() for o in os.environ['GCS_CORS_ORIGINS'].split(',') if o.strip()]
-        cors = [{
-            'origin': origins,
-            'method': ['GET', 'PUT', 'HEAD', 'OPTIONS'],
-            'responseHeader': ['Content-Type', 'Content-Length', 'x-goog-resumable'],
-            'maxAgeSeconds': 3600,
-        }]
-        with open('/tmp/cors.json', 'w') as f:
-            json.dump(cors, f)
-        "
+        # cloud-sdk ships gcloud only; python3 is not on PATH.
+        ORIGIN_JSON=$$(printf '%s' "$$GCS_CORS_ORIGINS" | awk -F',' '{
+          sep=""
+          for (i=1; i<=NF; i++) {
+            gsub(/^[ \t]+|[ \t]+$$/, "", $$i)
+            if ($$i != "") { printf "%s\"%s\"", sep, $$i; sep="," }
+          }
+        }')
+        cat > /tmp/cors.json <<EOF
+[{"origin":[$$ORIGIN_JSON],"method":["GET","PUT","HEAD","OPTIONS"],"responseHeader":["Content-Type","Content-Length","x-goog-resumable"],"maxAgeSeconds":3600}]
+EOF
         gcloud storage buckets update "$$BUCKET" --cors-file=/tmp/cors.json
 
   # Step 5: Cloud Tasks queue for durable AI evaluation (Phase 2)

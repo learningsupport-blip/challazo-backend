@@ -186,8 +186,15 @@ class ReviewMixin:
             for item in scorecard.get("metrics") or []
         ]
         analysis_id = submission.get("analysis_id")
+        existing = (
+            self.firebase.txn_get(transaction, self.analysis_collection, analysis_id)
+            if analysis_id
+            else None
+        )
+        stored_checklist = (existing or {}).get("checklist") if isinstance(existing, dict) else None
         analysis_fields = {
             "status": "completed",
+            "checklist": stored_checklist if isinstance(stored_checklist, str) else "",
             "report": report,
             "field_scores": field_rows,
             "scorecard": scorecard,
@@ -196,9 +203,7 @@ class ReviewMixin:
             "updated_at": now,
             "evaluation_source": "manual",
         }
-        if analysis_id and self.firebase.txn_get(
-            transaction, self.analysis_collection, analysis_id
-        ):
+        if existing:
             self.firebase.txn_update(
                 transaction,
                 self.analysis_collection,
@@ -215,7 +220,6 @@ class ReviewMixin:
                     "submission_id": submission_id,
                     "student_id": submission.get("student_id"),
                     "evaluation_criteria": None,
-                    "checklist": None,
                     "created_at": now,
                     **analysis_fields,
                 },

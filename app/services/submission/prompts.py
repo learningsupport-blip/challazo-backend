@@ -5,30 +5,10 @@ Firestore collection (see ``EvaluationPromptService``). Placeholders must stay
 in sync with ``REQUIRED_PLACEHOLDERS`` in ``evaluation_prompt_model``.
 """
 
-CHECKLIST_PROMPT = """You are a product analyst. Based on the PROBLEM STATEMENT and SOLUTION
-DESCRIPTION below, produce a "Product & Feature Validation Checklist" that
-will later be used to evaluate whether a demo video properly showcases
-this product.
-
-Structure your output as a numbered checklist with clear sections, similar
-to this style:
-
-1. PROBLEM ESTABLISHMENT (The Pain Points)
-- ...specific things the video should mention about the problem...
-
-2. CORE SOLUTION / FEATURE DEMONSTRATION
-- ...specific capabilities the video should visually demonstrate...
-
-3. WORKFLOW / INTEGRATION
-- ...how the solution should be shown working end-to-end...
-
-4. VALUE PROPOSITION & BENCHMARKS
-- ...explicit benefits/claims the video should confirm...
-
-Adapt section names and bullet points to fit the specific product described
-below (don't just copy the template above verbatim) — extract concrete,
-checkable criteria a reviewer can verify against the video. Output plain
-text only (no markdown headers like #, just numbered sections and bullets).
+CHECKLIST_PROMPT = """From the problem and solution below, write a checklist a reviewer can
+verify in the demo video. Use at most 4 numbered sections and at most 4
+bullets in each section. One line per bullet. Name each section for this
+product. Plain text only: no title, no preamble, no markdown headings.
 
 --- PROBLEM STATEMENT ---
 {problem_statement}
@@ -40,61 +20,44 @@ text only (no markdown headers like #, just numbered sections and bullets).
 """
 
 
-ANALYZE_VIDEO_PROMPT = """You are a video analysis agent. You have been given a video and a piece of
-reference "context" (requirements, a script, guidelines, or a checklist).
-
-Your job:
-1. Watch/analyze the video content carefully (visuals, spoken/on-screen
-   text, scenes, pacing, and overall narrative).
-2. Compare what is actually present in the video against the CONTEXT below.
-3. Produce a structured report in Markdown with these sections:
-
-## Video Summary
-A concise summary of what happens in the video.
-
-## Key Content Identified
-Bullet list of the key scenes, topics, claims, or elements present in the
-video.
-
-## Comparison Against Context
-For each relevant point in the CONTEXT, state whether the video:
-- Matches / Covers it (✅)
-- Partially covers it (⚠️)
-- Is missing it (❌)
-Explain briefly why for each.
-
-## Discrepancies & Issues
-Anything in the video that contradicts, conflicts with, or deviates from
-the context.
-
-## Overall Assessment
-A short verdict (e.g., compliant / non-compliant / needs revision) plus a
-1-5 score with justification.
-
-## Recommendations
-Concrete, actionable suggestions to align the video with the context.
+ANALYZE_VIDEO_PROMPT = """Watch the video, including what is said and what is on screen. Compare it
+to the CONTEXT. For each context point, decide whether the video covers it,
+covers it only in part, or misses it. Do not copy the context back.
 
 --- CONTEXT ---
 {context}
 --- END CONTEXT ---
 """
 
+# Appended after the analyze_video template so a stored admin prompt cannot
+# ask for a second long essay. The stored report is built from this JSON.
+VIDEO_OUTPUT_CONTRACT = """
+Return JSON only:
+{{
+  "summary": "<at most 4 sentences>",
+  "coverage": [
+    {{
+      "point": "<context point>",
+      "status": "covered|partial|missing",
+      "at": "<MM:SS when it appears, or empty>",
+      "note": "<at most 20 words>"
+    }}
+  ],
+  "issues": ["<short discrepancy, or an empty list>"],
+  "score": <number from 0 to {max_score}>,
+  "rationale": "<at most 2 sentences>"
+}}
+"""
 
-FIELD_SCORE_PROMPT = """You are a hackathon submission evaluator.
 
-Score the student's answer for the field "{field_label}" using the scoring
-instructions below. Be strict but fair.
+FIELD_SCORE_PROMPT = """Score the student's answer for "{field_label}" from 0 to {max_score}
+using the instructions below. If those instructions list sub-metrics, apply
+each one and return only the summed score.
 
-If the instructions define multiple sub-metrics, score each sub-metric first,
-then sum them into the final score (clamped to {max_score}).
-
-Return ONLY valid JSON with this shape:
+Return JSON only:
 {{
   "score": <number from 0 to {max_score}>,
-  "sub_scores": [
-    {{"name": "<sub-metric name>", "score": <number>, "max": <number>, "note": "<brief>"}}
-  ],
-  "rationale": "<2-5 sentences explaining how you arrived at the final score>"
+  "rationale": "<one or two sentences>"
 }}
 
 --- SCORING INSTRUCTIONS ---
@@ -107,24 +70,14 @@ Return ONLY valid JSON with this shape:
 """
 
 
-VIDEO_SCORE_PROMPT = """You are a hackathon demo-video evaluator.
+VIDEO_SCORE_PROMPT = """Score this demo-video report from 0 to {max_score} for clarity, feature
+coverage, and alignment with the context already reflected in the report.
 
-The VIDEO ANALYSIS REPORT below was produced using the admin-managed
-"analyze_video" AI Prompt (shown under REFERENCE ANALYSIS PROMPT).
-
-Assign a numeric Video Explanation score from 0 to {max_score} that reflects
-how well the demo meets that analysis standard (clarity, feature coverage,
-alignment with context, overall assessment in the report).
-
-Return ONLY valid JSON:
+Return JSON only:
 {{
   "score": <number from 0 to {max_score}>,
-  "rationale": "<2-5 sentences>"
+  "rationale": "<one or two sentences>"
 }}
-
---- REFERENCE ANALYSIS PROMPT (admin AI Prompts → analyze_video) ---
-{analyze_video_prompt}
---- END REFERENCE ANALYSIS PROMPT ---
 
 --- VIDEO ANALYSIS REPORT ---
 {video_report}
@@ -136,7 +89,7 @@ GITHUB_EVAL_CONTEXT_PROMPT = """You are a hackathon technical evaluator preparin
 automated GitHub repository analyzer.
 
 Read the student's problem statement and solution description, then produce:
-1. ``provided_context`` — one plain-text paragraph (150–400 words) describing what
+1. ``provided_context`` — one paragraph of at most 120 words describing what
    the project is, what it should do, and what the analyzer should verify in the repo.
 2. ``rubrics`` — 3–6 short must-have checks as strings (e.g. "Uses an LLM",
    "Has full-stack demo", "Matches stated problem").
@@ -168,9 +121,9 @@ DEFAULT_PROMPT_META = {
     "analyze_video": {
         "name": "Working Demo Video Analysis",
         "description": (
-            "Compares the submitted demo video against the checklist/context, "
-            "and is also the standard used when scoring the Video Explanation "
-            "scorecard metric (0–max). Placeholder: {context}."
+            "Compares the submitted demo video against the checklist. The model "
+            "returns compact JSON; the stored report is markdown built from it. "
+            "Placeholder: {context}."
         ),
     },
 }
@@ -261,6 +214,19 @@ _THEME_PLACEHOLDER_TOKENS = frozenset(
         "{THEME_NAME}",
     }
 )
+
+
+def scoring_placeholder_kind(token: str) -> str | None:
+    """Which submission section a rubric placeholder refers to, if it is a known one."""
+    name = (token or "").strip()
+    wrapped = "{" + name + "}"
+    if wrapped in _PROBLEM_PLACEHOLDER_TOKENS:
+        return "problem"
+    if wrapped in _THEME_PLACEHOLDER_TOKENS:
+        return "theme"
+    if name in _PLACEHOLDER_VALUE_KEYS["solution_description"]:
+        return "solution"
+    return None
 
 
 def scoring_prompt_has_problem_context(template: str) -> bool:

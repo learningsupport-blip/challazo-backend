@@ -116,7 +116,8 @@ steps:
           --max-concurrent-dispatches=5 \
           --max-dispatches-per-second=1 \
           --min-backoff=120s \
-          --max-backoff=3600s
+          --max-backoff=3600s \
+          --max-attempts=8
 
   # Step 6: Deploy to Cloud Run, then set Cloud Tasks target URL to this revision's URL
   # Prerequisite: Secret Manager secrets must exist (see README):

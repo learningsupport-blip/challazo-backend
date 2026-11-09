@@ -18,9 +18,9 @@ from urllib.parse import urlparse
 
 import requests
 from google import genai
-from google.genai import types
 
 from app.exceptions import InfrastructureError
+from app.services.gemini_output import generate_content
 from app.services.submission.prompts import GITHUB_EVAL_CONTEXT_PROMPT
 
 
@@ -71,10 +71,12 @@ class GitHubAiEvaluationService:
             problem_statement=problem_statement.strip(),
             solution_description=solution_description.strip(),
         )
-        response = client.models.generate_content(
+        response = generate_content(
+            client,
             model=self.model,
             contents=[prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
+            task="github",
+            json_response=True,
         )
         raw = (response.text or "").strip()
         parsed = self._parse_json_object(raw)

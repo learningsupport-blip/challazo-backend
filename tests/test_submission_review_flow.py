@@ -296,6 +296,7 @@ def test_manual_evaluation_after_ai_failure_scores_every_field(service: Submissi
     analysis_update = updates[0][0][3]
     submission_update = updates[1][0][3]
     assert analysis_update["status"] == "completed"
+    assert analysis_update["checklist"] == ""
     assert analysis_update["evaluation_source"] == "manual"
     assert submission_update["status"] == "completed"
     assert submission_update["evaluation_source"] == "manual"

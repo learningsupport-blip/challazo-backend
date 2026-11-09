@@ -10,10 +10,9 @@ import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
-from app.exceptions import AppError
+from app.services.evaluation_orchestration import EvaluationBusy
 
 from app.models.evaluation_job_model import (
-    EvaluateExternalJobRequest,
     EvaluateJobRequest,
     EvaluateJobResponse,
 )
@@ -59,14 +58,21 @@ async def run_evaluate_submission_job(
             request.submission_id,
             request.evaluation_criteria,
         )
+    except EvaluationBusy as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Evaluation already running",
+        ) from exc
     except ValueError as e:
-        detail = str(e)
-        code = (
-            status.HTTP_404_NOT_FOUND
-            if "not found" in detail.lower()
-            else status.HTTP_400_BAD_REQUEST
+        logger.info(
+            "evaluation event=rejected submission=%s error=%s",
+            request.submission_id,
+            e,
         )
-        raise HTTPException(status_code=code, detail=detail) from e
+        return EvaluateJobResponse(
+            status="rejected",
+            submission_id=request.submission_id,
+        )
     except Exception as e:
         # Non-2xx makes Cloud Tasks retry (desired for transient Gemini/GCS errors).
         logger.error(
@@ -82,63 +88,4 @@ async def run_evaluate_submission_job(
     return EvaluateJobResponse(
         status=result["status"],
         submission_id=result["submission_id"],
-    )
-
-
-@router.post(
-    "/evaluate-external-submission",
-    response_model=EvaluateJobResponse,
-    status_code=200,
-)
-async def run_evaluate_external_submission_job(
-    request: EvaluateExternalJobRequest,
-    x_internal_job_secret: str
-    | None = Header(
-        default=None,
-        alias="X-Internal-Job-Secret",
-    ),
-    jobs: EvaluationJobService = Depends(get_evaluation_job_service),
-) -> EvaluateJobResponse:
-    """
-    Execute Gemini analysis for one external submission.
-
-    Results are written to ``external_submissions``. The regular submission
-    worker is not used.
-    """
-    if not jobs.verify_job_secret(x_internal_job_secret):
-        logger.warning("Rejected external evaluate job: invalid or missing secret")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized",
-        )
-
-    from app.services.external_evaluation_service import ExternalEvaluationService
-
-    evaluator = ExternalEvaluationService(firebase=jobs._get_submission_service().firebase)
-    try:
-        result = await run_sync(evaluator.evaluate, request.external_submission_id)
-    except AppError:
-        raise
-    except ValueError as exc:
-        detail = str(exc)
-        code = (
-            status.HTTP_404_NOT_FOUND
-            if "not found" in detail.lower()
-            else status.HTTP_400_BAD_REQUEST
-        )
-        raise HTTPException(status_code=code, detail=detail) from exc
-    except Exception as exc:
-        logger.error(
-            "External evaluation job failed for %s: %s",
-            request.external_submission_id,
-            str(exc),
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Evaluation job failed",
-        ) from exc
-
-    return EvaluateJobResponse(
-        status=result["status"],
-        submission_id=result["external_submission_id"],
     )

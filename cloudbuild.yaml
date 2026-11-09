@@ -96,9 +96,7 @@ steps:
             if ($$i != "") { printf "%s\"%s\"", sep, $$i; sep="," }
           }
         }')
-        cat > /tmp/cors.json <<EOF
-[{"origin":[$$ORIGIN_JSON],"method":["GET","PUT","HEAD","OPTIONS"],"responseHeader":["Content-Type","Content-Length","x-goog-resumable"],"maxAgeSeconds":3600}]
-EOF
+        printf '%s\n' "[{\"origin\":[$$ORIGIN_JSON],\"method\":[\"GET\",\"PUT\",\"HEAD\",\"OPTIONS\"],\"responseHeader\":[\"Content-Type\",\"Content-Length\",\"x-goog-resumable\"],\"maxAgeSeconds\":3600}]" > /tmp/cors.json
         gcloud storage buckets update "$$BUCKET" --cors-file=/tmp/cors.json
 
   # Step 5: Cloud Tasks queue for durable AI evaluation (Phase 2)

@@ -34,6 +34,9 @@ Student submission routes.
 
 import json
 
+import logging
+import time
+
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -48,6 +51,7 @@ from fastapi import (
 )
 
 from app.exceptions import AppError, http_exception_from_value_error
+from app.services.evaluation_orchestration import decide
 from app.models.export_model import GoogleSheetExportRequest, GoogleSheetExportResponse
 from app.middleware.auth_middleware import (
     get_active_user,
@@ -99,6 +103,7 @@ from app.utils.video_upload import (
 
 
 router = APIRouter(prefix="/submissions", tags=["submissions"])
+logger = logging.getLogger(__name__)
 
 
 async def _to_submission_response(
@@ -609,7 +614,7 @@ async def list_hackathons_for_evaluator(
 ) -> list[HackathonSubmissionSummary]:
     """
     Evaluator Submissions home: hackathons that have at least one submission
-    assigned to this evaluator, with assigned counts.
+    assigned to this evaluator, with assigned, completed, and pending counts.
     """
     summaries = await run_sync(
         service.list_hackathons_with_submission_counts,
@@ -856,6 +861,27 @@ async def evaluate_submission(
             status_code=status.HTTP_409_CONFLICT,
             detail="This submission is already being analyzed",
         )
+
+    try:
+        key = service.current_evaluation_key(
+            submission,
+            request.evaluation_criteria,
+            submission_id=submission_id,
+        )
+    except Exception:
+        logger.warning(
+            "evaluation event=start reason=key_unavailable submission=%s",
+            submission_id,
+            exc_info=True,
+        )
+        key = ""
+    if key and decide(submission, key, time.time()) == "deduped":
+        logger.info(
+            "evaluation event=deduped reason=same_inputs submission=%s key=%s",
+            submission_id,
+            key[:12],
+        )
+        return await _to_submission_response(service, submission, current_user=current_user)
 
     try:
         await run_sync(

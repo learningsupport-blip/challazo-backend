@@ -51,6 +51,21 @@ class HackathonSubmissionSummary(BaseModel):
     start_time: str = "00:00"
     end_time: str = "23:59"
     submission_count: int
+    completed_count: Optional[int] = Field(
+        None,
+        description=(
+            "Evaluator home only. Assigned submissions this evaluator has handed "
+            "in: review_status is pending_review or approved."
+        ),
+    )
+    pending_count: Optional[int] = Field(
+        None,
+        description=(
+            "Evaluator home only. Assigned submissions still with this evaluator: "
+            "review_status is none or changes_requested. "
+            "completed_count + pending_count equals submission_count."
+        ),
+    )
     banner_url: Optional[str] = None
     auto_ai_evaluation: bool = Field(
         False,

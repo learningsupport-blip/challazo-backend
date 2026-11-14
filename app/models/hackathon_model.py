@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.models.evaluation_requirement_model import RoundEvaluationRequirement
 from app.models.string_utils import strip_optional, strip_required
 from app.models.theme_model import ThemeSummary
 from app.utils.hackathon_schedule import (
@@ -57,6 +58,18 @@ class TimelineRound(BaseModel):
     evaluation_requirement_id: Optional[str] = Field(
         None,
         description="Id of a reusable evaluation requirement linked to this round.",
+    )
+    evaluation_requirement: Optional[RoundEvaluationRequirement] = Field(
+        None,
+        description=(
+            "Resolved requirement for this round. Read-only. Students submit "
+            "against this requirement and cannot choose a different one."
+        ),
+    )
+    round_index: Optional[int] = Field(
+        None,
+        ge=0,
+        description="0-based index in the stored timeline. Set on API responses.",
     )
     team_size_mode: Optional[str] = Field(
         None,

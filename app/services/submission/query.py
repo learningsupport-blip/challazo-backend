@@ -23,6 +23,14 @@ from app.utils.hackathon_round import (
 
 ADMIN_SUBMISSION_STATUSES = frozenset({"uploaded", "processing", "completed", "failed"})
 ADMIN_REVIEW_STATUSES = frozenset({"none", "pending_review", "changes_requested", "approved"})
+EVALUATOR_HANDED_IN = frozenset({"pending_review", "approved"})
+
+
+def _evaluator_handed_in(submission: dict[str, Any]) -> bool:
+    """True once this evaluator has submitted the review and is not waiting on a redo."""
+    return (submission.get("review_status") or "none") in EVALUATOR_HANDED_IN
+
+
 DEFAULT_SUBMISSION_PAGE_SIZE = 10
 MAX_SUBMISSION_PAGE_SIZE = 100
 
@@ -312,11 +320,14 @@ class QueryMixin:
             submissions = self.firebase.get_collection(self.collection)
 
         counts: dict[str, int] = {}
+        completed_counts: dict[str, int] = {}
         for submission in submissions:
             hid = submission.get("hackathon_id")
             if not hid:
                 continue
             counts[hid] = counts.get(hid, 0) + 1
+            if evaluator_id and _evaluator_handed_in(submission):
+                completed_counts[hid] = completed_counts.get(hid, 0) + 1
 
         summaries: list[dict[str, Any]] = []
         for hackathon in hackathons:
@@ -337,6 +348,10 @@ class QueryMixin:
                     "auto_ai_evaluation": bool(enriched.get("auto_ai_evaluation", False)),
                 }
             )
+            if evaluator_id:
+                completed = completed_counts.get(enriched["id"], 0)
+                summaries[-1]["completed_count"] = completed
+                summaries[-1]["pending_count"] = count - completed
             if not evaluator_id:
                 summaries[-1]["export_spreadsheet_url"] = enriched.get("export_spreadsheet_url")
                 summaries[-1]["export_spreadsheet_synced_at"] = enriched.get(
@@ -539,8 +554,8 @@ class QueryMixin:
             if analysis_doc and analysis_doc.get("status") == "completed":
                 enriched["analysis"] = {
                     "id": analysis_id,
-                    "checklist": analysis_doc["checklist"],
-                    "report": analysis_doc["report"],
+                    "checklist": analysis_doc.get("checklist") or "",
+                    "report": analysis_doc.get("report") or "",
                     "field_scores": analysis_doc.get("field_scores"),
                     "scorecard": analysis_doc.get("scorecard") or enriched.get("scorecard"),
                     "analyzed_at": analysis_doc["analyzed_at"],

@@ -2,7 +2,7 @@
 Reusable evaluation-requirement routes.
 
     POST   /evaluation-requirements        -> admin creates a reusable requirement
-    GET    /evaluation-requirements        -> list requirements (for the round dropdown)
+    GET    /evaluation-requirements        -> admin list (hackathon round picker)
     GET    /evaluation-requirements/{id}   -> get a single requirement
     PATCH  /evaluation-requirements/{id}   -> admin updates a requirement
     DELETE /evaluation-requirements/{id}   -> admin deletes a requirement
@@ -64,10 +64,10 @@ async def create_evaluation_requirement(
 
 @router.get("", response_model=list[EvaluationRequirementResponse])
 async def list_evaluation_requirements(
-    current_user: CurrentUser = Depends(get_current_user),
+    _admin: CurrentUser = Depends(get_admin_user),
     service: EvaluationRequirementService = Depends(get_evaluation_requirement_service),
 ) -> list[EvaluationRequirementResponse]:
-    """List all evaluation requirements (used to populate the round dropdown)."""
+    """List every requirement. Admin only; this feeds the round picker."""
     requirements = await run_sync(service.list_requirements)
     return [EvaluationRequirementResponse(**item) for item in requirements]
 

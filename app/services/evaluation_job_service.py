@@ -14,10 +14,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Literal
 
 from fastapi import BackgroundTasks
 
+from app.services.evaluation_orchestration import EvaluationBusy, apply_claim
 from app.services.evaluation_routing import worker_urls
 from app.utils.ids import new_id
 
@@ -71,24 +73,6 @@ class EvaluationJobService:
         logger.info(
             "Enqueued Cloud Task for submission %s (task=%s, worker=%s)",
             submission_id,
-            task_name,
-            worker_key,
-        )
-        return task_name
-
-    def enqueue_external_cloud_task(self, external_submission_id: str) -> str:
-        """Queue Gemini for an external submission. Regular jobs are unchanged."""
-        from app.services.external_evaluation_service import external_job_url
-
-        worker_key, url = self._select_worker_url()
-        task_name, _worker = self._enqueue_http_task(
-            url=external_job_url(url),
-            payload={"external_submission_id": external_submission_id},
-            task_prefix=f"ext-{external_submission_id[:32]}",
-        )
-        logger.info(
-            "Enqueued external Cloud Task for %s (task=%s, worker=%s)",
-            external_submission_id,
             task_name,
             worker_key,
         )
@@ -157,11 +141,36 @@ class EvaluationJobService:
             analysis = service.firebase.get_document(service.analysis_collection, analysis_id)
             if analysis and analysis.get("status") == "completed":
                 logger.info(
-                    "Skipping evaluation job for %s — already completed",
+                    "evaluation event=deduped reason=already_completed submission=%s",
                     submission_id,
                 )
                 return {"status": "already_completed", "submission_id": submission_id}
 
+        key = service.current_evaluation_key(
+            submission,
+            evaluation_criteria,
+            submission_id=submission_id,
+        )
+        outcome = self._claim_turn(service, submission_id, key)
+        if outcome == "deduped":
+            logger.info(
+                "evaluation event=deduped reason=completed submission=%s key=%s",
+                submission_id,
+                key[:12],
+            )
+            return {"status": "already_completed", "submission_id": submission_id}
+        if outcome == "busy":
+            logger.info(
+                "evaluation event=deduped reason=busy submission=%s key=%s",
+                submission_id,
+                key[:12],
+            )
+            raise EvaluationBusy()
+        logger.info(
+            "evaluation event=start submission=%s key=%s",
+            submission_id,
+            key[:12],
+        )
         service.evaluate_submission(
             submission_id,
             evaluation_criteria=evaluation_criteria,
@@ -173,6 +182,23 @@ class EvaluationJobService:
         if not expected:
             return False
         return bool(provided) and provided == expected
+
+    def _claim_turn(self, service: Any, submission_id: str, key: str) -> str:
+        now = time.time()
+
+        def _txn(transaction: Any) -> str:
+            current = service.firebase.txn_get(transaction, service.collection, submission_id)
+            outcome, patch = apply_claim(current, key, now)
+            if patch:
+                service.firebase.txn_update(
+                    transaction,
+                    service.collection,
+                    submission_id,
+                    patch,
+                )
+            return outcome
+
+        return service.firebase.run_transaction(_txn)
 
     def _enqueue_cloud_task(
         self,

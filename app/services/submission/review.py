@@ -7,6 +7,7 @@ from typing import Any
 from app.utils.ids import new_id
 from app.utils.time import now_ist_iso
 
+from app.utils.hackathon_round import requirement_id_on_round
 from app.services.scorecard import (
     apply_ai_overrides,
     apply_evaluator_field_scores,
@@ -186,8 +187,15 @@ class ReviewMixin:
             for item in scorecard.get("metrics") or []
         ]
         analysis_id = submission.get("analysis_id")
+        existing = (
+            self.firebase.txn_get(transaction, self.analysis_collection, analysis_id)
+            if analysis_id
+            else None
+        )
+        stored_checklist = (existing or {}).get("checklist") if isinstance(existing, dict) else None
         analysis_fields = {
             "status": "completed",
+            "checklist": stored_checklist if isinstance(stored_checklist, str) else "",
             "report": report,
             "field_scores": field_rows,
             "scorecard": scorecard,
@@ -196,9 +204,7 @@ class ReviewMixin:
             "updated_at": now,
             "evaluation_source": "manual",
         }
-        if analysis_id and self.firebase.txn_get(
-            transaction, self.analysis_collection, analysis_id
-        ):
+        if existing:
             self.firebase.txn_update(
                 transaction,
                 self.analysis_collection,
@@ -215,7 +221,6 @@ class ReviewMixin:
                     "submission_id": submission_id,
                     "student_id": submission.get("student_id"),
                     "evaluation_criteria": None,
-                    "checklist": None,
                     "created_at": now,
                     **analysis_fields,
                 },
@@ -251,7 +256,9 @@ class ReviewMixin:
         if not hackathon_id:
             return []
         hackathon = self.hackathon_service.get_hackathon(hackathon_id)
-        requirement_id = self._resolve_evaluation_requirement_id(hackathon)
+        requirement_id = self._resolve_evaluation_requirement_id(
+            hackathon, submission.get("round_index")
+        )
         if not requirement_id:
             return []
         scoring_svc = getattr(self, "metric_scoring_service", None)
@@ -323,14 +330,21 @@ class ReviewMixin:
     @staticmethod
     def _resolve_evaluation_requirement_id(
         hackathon: dict[str, Any] | None,
+        round_index: int | None = None,
     ) -> str | None:
         if not hackathon:
             return None
-        for round_ in hackathon.get("timeline") or []:
-            if isinstance(round_, dict):
-                req_id = (round_.get("evaluation_requirement_id") or "").strip()
-            else:
-                req_id = (getattr(round_, "evaluation_requirement_id", None) or "").strip()
+        timeline = hackathon.get("timeline") or []
+        if round_index is not None:
+            try:
+                index = int(round_index)
+            except (TypeError, ValueError):
+                return None
+            if index < 0 or index >= len(timeline):
+                return None
+            return requirement_id_on_round(timeline[index]) or None
+        for round_ in timeline:
+            req_id = requirement_id_on_round(round_)
             if req_id:
                 return req_id
         return None

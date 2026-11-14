@@ -3,8 +3,8 @@
 substitutions:
   _SERVICE_NAME: 'challazo-backend'
   _AR_REPO: 'challazo-backend'
-  _ALLOWED_ORIGINS: 'https://challazo.in,https://www.challazo.in,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173'
-  _GCS_CORS_ORIGINS: 'https://challazo.in,https://www.challazo.in,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173'
+  _ALLOWED_ORIGINS: 'https://challazo.in,https://www.challazo.in,https://dev.challazo.in,https://www.dev.challazo.in,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173'
+  _GCS_CORS_ORIGINS: 'https://challazo.in,https://www.challazo.in,https://dev.challazo.in,https://www.dev.challazo.in,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173'
   _ENVIRONMENT: 'production'
   _SEED_ON_STARTUP: 'false'
   # Brevo SMTP (non-secret). SMTP_USERNAME + SMTP_PASSWORD come from Secret Manager.
@@ -88,18 +88,15 @@ steps:
             --uniform-bucket-level-access
           echo "Created $$BUCKET in $$DESIRED_LOCATION"
         fi
-        python3 -c "
-        import json, os
-        origins = [o.strip() for o in os.environ['GCS_CORS_ORIGINS'].split(',') if o.strip()]
-        cors = [{
-            'origin': origins,
-            'method': ['GET', 'PUT', 'HEAD', 'OPTIONS'],
-            'responseHeader': ['Content-Type', 'Content-Length', 'x-goog-resumable'],
-            'maxAgeSeconds': 3600,
-        }]
-        with open('/tmp/cors.json', 'w') as f:
-            json.dump(cors, f)
-        "
+        # cloud-sdk ships gcloud only; python3 is not on PATH.
+        ORIGIN_JSON=$$(printf '%s' "$$GCS_CORS_ORIGINS" | awk -F',' '{
+          sep=""
+          for (i=1; i<=NF; i++) {
+            gsub(/^[ \t]+|[ \t]+$$/, "", $$i)
+            if ($$i != "") { printf "%s\"%s\"", sep, $$i; sep="," }
+          }
+        }')
+        printf '%s\n' "[{\"origin\":[$$ORIGIN_JSON],\"method\":[\"GET\",\"PUT\",\"HEAD\",\"OPTIONS\"],\"responseHeader\":[\"Content-Type\",\"Content-Length\",\"x-goog-resumable\"],\"maxAgeSeconds\":3600}]" > /tmp/cors.json
         gcloud storage buckets update "$$BUCKET" --cors-file=/tmp/cors.json
 
   # Step 5: Cloud Tasks queue for durable AI evaluation (Phase 2)
@@ -116,7 +113,8 @@ steps:
           --max-concurrent-dispatches=5 \
           --max-dispatches-per-second=1 \
           --min-backoff=120s \
-          --max-backoff=3600s
+          --max-backoff=3600s \
+          --max-attempts=8
 
   # Step 6: Deploy to Cloud Run, then set Cloud Tasks target URL to this revision's URL
   # Prerequisite: Secret Manager secrets must exist (see README):

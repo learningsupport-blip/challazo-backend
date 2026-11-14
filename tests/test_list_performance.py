@@ -130,7 +130,12 @@ def test_list_hackathons_evaluator_uses_query_not_full_scan():
                 "end_date": "2026-01-02",
             }
         ]
-        svc.firebase.query_collection.return_value = [{"hackathon_id": "h1"}]
+        svc.firebase.query_collection.return_value = [
+            {"hackathon_id": "h1", "review_status": "pending_review"},
+            {"hackathon_id": "h1", "review_status": "approved"},
+            {"hackathon_id": "h1", "review_status": "none"},
+            {"hackathon_id": "h1", "review_status": "changes_requested"},
+        ]
         svc.hackathon_service.enrich_hackathon_for_submission_summary.return_value = {
             "id": "h1",
             "name": "Hack",
@@ -140,7 +145,9 @@ def test_list_hackathons_evaluator_uses_query_not_full_scan():
         }
 
         rows = svc.list_hackathons_with_submission_counts(evaluator_id="eval-1")
-        assert rows[0]["submission_count"] == 1
+        assert rows[0]["submission_count"] == 4
+        assert rows[0]["completed_count"] == 2
+        assert rows[0]["pending_count"] == 2
         svc.firebase.query_collection.assert_called_once_with(
             "submissions", "assigned_evaluator_id", "==", "eval-1"
         )

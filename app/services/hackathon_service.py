@@ -458,6 +458,8 @@ class HackathonService:
             merged: list[dict[str, Any]] = []
             for index, round_ in enumerate(request.timeline):
                 incoming = round_.model_dump()
+                incoming.pop("evaluation_requirement", None)
+                incoming.pop("round_index", None)
                 prior = existing_timeline[index] if index < len(existing_timeline) else {}
                 if isinstance(prior, dict) and round_is_published(prior):
                     incoming["published"] = True
@@ -939,6 +941,8 @@ class HackathonService:
     @staticmethod
     def _normalize_round_for_storage(round_: dict[str, Any], *, published: bool) -> dict[str, Any]:
         data = dict(round_)
+        data.pop("evaluation_requirement", None)
+        data.pop("round_index", None)
         data["published"] = published
         if not published:
             data["published_at"] = None
@@ -950,11 +954,48 @@ class HackathonService:
             data["leaderboard_published_by"] = None
         return data
 
+    def round_evaluation_requirement(
+        self,
+        hackathon: dict[str, Any],
+        round_index: int,
+        *,
+        published_only: bool,
+    ) -> dict[str, Any] | None:
+        """The requirement linked to one stored timeline round, or None."""
+        timeline = hackathon.get("timeline") or []
+        if round_index < 0 or round_index >= len(timeline):
+            return None
+        round_ = timeline[round_index]
+        data = dict(round_) if isinstance(round_, dict) else round_.model_dump()
+        if published_only and not data.get("published"):
+            return None
+        return self._public_requirement(data.get("evaluation_requirement_id"))
+
+    def _public_requirement(self, requirement_id: Any) -> dict[str, Any] | None:
+        req_id = requirement_id.strip() if isinstance(requirement_id, str) else ""
+        if not req_id:
+            return None
+        document = self.evaluation_requirements.get_requirement(req_id)
+        if not document:
+            return None
+        return {
+            "id": document.get("id") or req_id,
+            "name": document.get("name") or "",
+            "description": document.get("description"),
+            "fields": document.get("fields") or [],
+        }
+
     def _enrich_timeline_rounds(
         self, hackathon: dict[str, Any], timeline: list[Any]
     ) -> list[dict[str, Any]]:
         enriched: list[dict[str, Any]] = []
-        for round_ in timeline:
+        for index, round_ in enumerate(timeline):
             data = dict(round_) if isinstance(round_, dict) else round_.model_dump()
-            enriched.append(enrich_timeline_round(data, hackathon=hackathon))
+            data.pop("evaluation_requirement", None)
+            resolved = enrich_timeline_round(data, hackathon=hackathon)
+            resolved["round_index"] = index
+            resolved["evaluation_requirement"] = self._public_requirement(
+                resolved.get("evaluation_requirement_id")
+            )
+            enriched.append(resolved)
         return enriched

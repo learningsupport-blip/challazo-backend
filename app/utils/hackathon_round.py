@@ -24,6 +24,16 @@ TEAM_MODE_LABELS = {
 }
 TEAM_SIZE_MODES = ("single", "multi", "open")
 
+
+def requirement_id_on_round(round_: Any) -> str:
+    """Return the evaluation requirement id stored on one timeline round."""
+    if isinstance(round_, dict):
+        raw = round_.get("evaluation_requirement_id")
+    else:
+        raw = getattr(round_, "evaluation_requirement_id", None)
+    return raw.strip() if isinstance(raw, str) else ""
+
+
 RoundStatus = Literal["draft", "scheduled", "open", "closed"]
 CatalogStatus = Literal["upcoming", "open", "closing_soon", "closed"]
 

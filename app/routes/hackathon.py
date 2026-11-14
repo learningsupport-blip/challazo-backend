@@ -9,6 +9,7 @@ Hackathon routes.
     PATCH  /hackathons/{id}       -> admin updates a hackathon (multipart, banner optional)
     DELETE /hackathons/{id}       -> admin deletes a hackathon
     POST   /hackathons/{id}/rounds/{index}/publish -> admin publishes a round
+    GET    /hackathons/{id}/rounds/{index}/requirement -> the round's locked requirement
     GET    /hackathons/{id}/rounds/{index}/leaderboard -> ranked results
     POST   /hackathons/{id}/rounds/{index}/leaderboard/publish -> admin publishes ranks (no email)
     GET    /hackathons/{id}/rounds/{index}/winners -> super admin: preview top N
@@ -52,6 +53,7 @@ from app.middleware.auth_middleware import (
     get_super_admin_user,
 )
 from app.exceptions import AppError
+from app.models.evaluation_requirement_model import RoundEvaluationRequirement
 from app.models.hackathon_model import (
     HackathonCatalogItem,
     HackathonCreateRequest,
@@ -813,6 +815,42 @@ async def list_hackathon_themes(
             detail="Hackathon not found",
         )
     return [ThemeResponse(**item) for item in themes]
+
+
+@router.get(
+    "/{hackathon_id}/rounds/{round_index}/requirement",
+    response_model=RoundEvaluationRequirement,
+)
+async def get_round_evaluation_requirement(
+    hackathon_id: str,
+    round_index: int,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: HackathonService = Depends(get_hackathon_service),
+) -> RoundEvaluationRequirement:
+    """
+    Return the evaluation requirement linked to this round.
+
+    Students only receive it for a published round they can see. The form
+    loads these fields; the student does not choose a different requirement.
+    """
+    hackathon = await run_sync(service.get_hackathon, hackathon_id)
+    if not hackathon or not visible_to_viewer(hackathon, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Hackathon not found",
+        )
+    requirement = await run_sync(
+        service.round_evaluation_requirement,
+        hackathon,
+        round_index,
+        published_only=current_user.role == "student",
+    )
+    if not requirement:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Evaluation requirement not found for this round",
+        )
+    return RoundEvaluationRequirement(**requirement)
 
 
 @router.get("/{hackathon_id}", response_model=HackathonResponse)

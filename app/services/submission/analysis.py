@@ -27,6 +27,7 @@ from app.services.gemini_budget import assert_gemini_enabled, note_submission_ev
 from app.services.gemini_output import field_score_task, generate_content
 from app.services.scorecard import apply_ai_field_scores, build_scorecard_skeleton
 from app.services.submission.create import demo_video_required
+from app.utils.hackathon_round import requirement_id_on_round
 from app.services.submission.prompts import (
     VIDEO_OUTPUT_CONTRACT,
     VIDEO_SCORE_PROMPT,
@@ -158,7 +159,9 @@ class AnalysisMixin:
             note_submission_evaluation(submission_id)
             client = self._build_genai_client()
             extra_criteria = evaluation_criteria or submission.get("evaluation_criteria")
-            _scoring_config, metric_defs = self._load_scoring_config(hackathon)
+            _scoring_config, metric_defs = self._load_scoring_config(
+                hackathon, submission.get("round_index")
+            )
             field_scores = self._score_ai_metrics(
                 client, submission, metric_defs, problem=problem, solution=solution
             )
@@ -414,8 +417,13 @@ class AnalysisMixin:
         hackathon_id = (submission.get("hackathon_id") or "").strip()
         if hackathon_id:
             hackathon = self.hackathon_service.get_hackathon(hackathon_id)
-        requirement_id = self._resolve_evaluation_requirement_id(hackathon) or ""
-        _scoring, metrics = self._load_scoring_config(hackathon)
+        requirement_id = (
+            self._resolve_evaluation_requirement_id(hackathon, submission.get("round_index"))
+            or ""
+        )
+        _scoring, metrics = self._load_scoring_config(
+            hackathon, submission.get("round_index")
+        )
         prompt_id = hackathon_id or None
         settings = media_settings()
         criteria = evaluation_criteria
@@ -599,9 +607,11 @@ class AnalysisMixin:
         return parsed
 
     def _load_scoring_config(
-        self, hackathon: dict[str, Any] | None
+        self,
+        hackathon: dict[str, Any] | None,
+        round_index: int | None = None,
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-        requirement_id = self._resolve_evaluation_requirement_id(hackathon)
+        requirement_id = self._resolve_evaluation_requirement_id(hackathon, round_index)
         if not requirement_id:
             return None, []
         scoring = self.metric_scoring_service.get_scoring_for_requirement(requirement_id)
@@ -999,14 +1009,23 @@ class AnalysisMixin:
         return "\n".join(lines).rstrip()
 
     @staticmethod
-    def _resolve_evaluation_requirement_id(hackathon: dict[str, Any] | None) -> str | None:
+    def _resolve_evaluation_requirement_id(
+        hackathon: dict[str, Any] | None,
+        round_index: int | None = None,
+    ) -> str | None:
         if not hackathon:
             return None
-        for round_ in hackathon.get("timeline") or []:
-            if isinstance(round_, dict):
-                req_id = (round_.get("evaluation_requirement_id") or "").strip()
-            else:
-                req_id = (getattr(round_, "evaluation_requirement_id", None) or "").strip()
+        timeline = hackathon.get("timeline") or []
+        if round_index is not None:
+            try:
+                index = int(round_index)
+            except (TypeError, ValueError):
+                return None
+            if index < 0 or index >= len(timeline):
+                return None
+            return requirement_id_on_round(timeline[index]) or None
+        for round_ in timeline:
+            req_id = requirement_id_on_round(round_)
             if req_id:
                 return req_id
         return None

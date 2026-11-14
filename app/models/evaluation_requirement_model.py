@@ -115,6 +115,15 @@ class EvaluationRequirementUpdateRequest(BaseModel):
         return value
 
 
+class RoundEvaluationRequirement(BaseModel):
+    """Requirement locked to one hackathon round. Students cannot choose another."""
+
+    id: str
+    name: str
+    description: Optional[str] = None
+    fields: list[RequirementField]
+
+
 class EvaluationRequirementResponse(BaseModel):
     """A reusable evaluation requirement returned to clients."""
 

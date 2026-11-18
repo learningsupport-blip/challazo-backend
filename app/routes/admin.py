@@ -6,6 +6,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import Response
 
 from app.exceptions import AppError, http_exception_from_value_error
 from app.dependencies import get_user_service
@@ -47,6 +48,60 @@ async def get_admin_overview(
             detail="Error retrieving overview",
         ) from exc
     return AdminOverviewResponse(**payload)
+
+
+@router.get("/users/export")
+async def export_users(
+    role: str = Query(
+        "student",
+        description=(
+            "student or evaluator. Defaults to student, so an unfiltered export is every student."
+        ),
+    ),
+    q: Optional[str] = Query(
+        None,
+        max_length=200,
+        description=(
+            "Case-insensitive match on name, email, niat id, college id, "
+            "employee id, user id, or mobile number."
+        ),
+    ),
+    university_id: Optional[str] = Query(
+        None,
+        description="University document id. When set, the file contains only that college.",
+    ),
+    admin: CurrentUser = Depends(get_admin_user),
+    user_service: UserService = Depends(get_user_service),
+) -> Response:
+    """
+    CSV of every user matching the Student Management filters.
+
+    ``role``, ``university_id``, and ``q`` match ``GET /admin/users``. The file
+    is the full filtered list, not one page.
+    """
+    _ = admin
+    try:
+        content, filename = await run_sync(
+            user_service.export_users_csv,
+            role=role.strip().lower() if role else "student",
+            q=q,
+            university_id=university_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except AppError:
+        raise
+    except Exception as exc:
+        logger.exception("Error exporting users")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error exporting users",
+        ) from exc
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/users", status_code=200, response_model=PaginatedUsersResponse | list[UserResponse])

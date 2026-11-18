@@ -2,14 +2,18 @@
 User service for managing user operations
 """
 
+import csv
+import io
 import logging
+import re
+from datetime import datetime
 from typing import Any, Optional
-from app.utils.time import now_ist_iso
 
 from app.exceptions import ConflictError, InfrastructureError, NotFoundError
 from app.models.user_model import ApprovalStatus, TeamMember, UserResponse, UserRole
 from app.services.firebase import FirebaseService
 from app.services.university_service import UniversityService
+from app.utils.time import now_ist, now_ist_iso, parse_to_ist
 
 
 logger = logging.getLogger(__name__)
@@ -17,6 +21,31 @@ logger = logging.getLogger(__name__)
 DEFAULT_USER_PAGE_SIZE = 15
 MAX_USER_PAGE_SIZE = 100
 USER_LIST_ROLES = frozenset({"student", "evaluator"})
+_CSV_FORMULA_PREFIXES = "=+-@"
+USER_EXPORT_HEADERS = (
+    "Student ID",
+    "First Name",
+    "Last Name",
+    "Full Name",
+    "Email",
+    "Mobile No",
+    "College Type",
+    "NIAT ID",
+    "College ID",
+    "University",
+    "University ID",
+    "University Location",
+    "Batch",
+    "Batch ID",
+    "Team Name",
+    "Team Leader",
+    "Team Members",
+    "Approval Status",
+    "Email Verified",
+    "Phone Verified",
+    "Registered At",
+    "Last Updated At",
+)
 
 
 class UserService:
@@ -161,12 +190,34 @@ class UserService:
         a substring of the stored number, so ``98259`` matches
         ``+919640198259``. Newest ``created_at`` first.
         """
+        users, _university = self._matching_users(role=role, q=q, university_id=university_id)
+        page = max(int(page), 1)
+        page_size = min(max(int(page_size), 1), MAX_USER_PAGE_SIZE)
+        start = (page - 1) * page_size
+        return {
+            "items": users[start : start + page_size],
+            "total": len(users),
+            "page": page,
+            "page_size": page_size,
+        }
+
+    def _matching_users(
+        self,
+        *,
+        role: str | None,
+        q: str | None,
+        university_id: str | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """Full newest-first list for one role, college, and search.
+
+        The university item is included when ``university_id`` is set so a
+        download can name the file after that college.
+        """
         if role is not None and role not in USER_LIST_ROLES:
             raise ValueError("role must be student or evaluator")
 
-        college_id = self._require_listed_university(university_id)
-        page = max(int(page), 1)
-        page_size = min(max(int(page_size), 1), MAX_USER_PAGE_SIZE)
+        university = self._require_listed_university(university_id)
+        college_id = str(university["id"]) if university else None
         needle = (q or "").strip().lower()
 
         if role:
@@ -182,17 +233,37 @@ class UserService:
 
         users.sort(key=lambda user: (user.get("name") or "").lower())
         users.sort(key=lambda user: user.get("created_at") or "", reverse=True)
+        return users, university
 
-        start = (page - 1) * page_size
-        return {
-            "items": users[start : start + page_size],
-            "total": len(users),
-            "page": page,
-            "page_size": page_size,
-        }
+    def export_users_csv(
+        self,
+        *,
+        role: str | None = "student",
+        q: str | None = None,
+        university_id: str | None = None,
+    ) -> tuple[bytes, str]:
+        """Every matching user as a UTF-8 CSV, plus the download filename.
 
-    def _require_listed_university(self, university_id: str | None) -> str | None:
-        """Return a known university id, or None when the filter is omitted.
+        Omitting ``role`` exports students. The file is the full filtered list,
+        not one page of ``paginate_users``.
+        """
+        selected_role = (role or "student").strip().lower() or "student"
+        users, university = self._matching_users(
+            role=selected_role,
+            q=q,
+            university_id=university_id,
+        )
+        filename = f"students-{self._college_slug(university)}-{now_ist():%Y%m%d-%H%M}.csv"
+        buffer = io.StringIO()
+        buffer.write("\ufeff")
+        writer = csv.writer(buffer)
+        writer.writerow(USER_EXPORT_HEADERS)
+        for user in users:
+            writer.writerow(self._export_row(user))
+        return buffer.getvalue().encode("utf-8"), filename
+
+    def _require_listed_university(self, university_id: str | None) -> dict[str, Any] | None:
+        """Return a known university, or None when the filter is omitted.
 
         Raises ValueError for a blank, path-like, or unknown id. The message
         avoids "not found" so a ValueError that escapes the route stays 400.
@@ -205,7 +276,72 @@ class UserService:
         university = UniversityService(firebase=self.firebase).get_university(cleaned)
         if not university:
             raise ValueError("Unknown university")
-        return cleaned
+        return university
+
+    @staticmethod
+    def _college_slug(university: dict[str, Any] | None) -> str:
+        """Filename piece for the selected college. ``all`` when unfiltered."""
+        if not university:
+            return "all"
+        label = str(university.get("display_label") or university.get("name") or "")
+        slug = re.sub(r"[^a-z0-9]+", "-", label.casefold()).strip("-")
+        return slug or "all"
+
+    def _export_row(self, user: dict[str, Any]) -> list[str]:
+        """One CSV row from the same profile mapping as the JSON list."""
+        profile = self.to_user_response(str(user.get("id") or ""), user)
+        return [
+            self._csv_cell(profile.id),
+            self._csv_cell(profile.first_name),
+            self._csv_cell(profile.last_name),
+            self._csv_cell(profile.name),
+            self._csv_cell(profile.email),
+            self._csv_cell(profile.mobile_no),
+            self._csv_cell(profile.college_type),
+            self._csv_cell(profile.niat_id),
+            self._csv_cell(profile.college_id),
+            self._csv_cell(profile.university),
+            self._csv_cell(profile.university_id),
+            self._csv_cell(profile.university_location),
+            self._csv_cell(profile.batch_name),
+            self._csv_cell(profile.batch_id),
+            self._csv_cell(profile.team_name),
+            self._csv_cell(profile.team_leader_name),
+            self._csv_cell(self._team_members_cell(profile.team_members)),
+            self._csv_cell(profile.approval_status),
+            self._csv_cell(self._yes_no(profile.email_verified)),
+            self._csv_cell(self._yes_no(profile.phone_verified)),
+            self._csv_cell(self._export_timestamp(profile.created_at)),
+            self._csv_cell(self._export_timestamp(profile.updated_at)),
+        ]
+
+    @staticmethod
+    def _team_members_cell(members: list[TeamMember] | None) -> str:
+        if not members:
+            return ""
+        return "; ".join(f"{member.name} <{member.email}>" for member in members)
+
+    @staticmethod
+    def _yes_no(value: bool | None) -> str:
+        if value is None:
+            return ""
+        return "Yes" if value else "No"
+
+    @staticmethod
+    def _export_timestamp(value: datetime | None) -> str:
+        if value is None:
+            return ""
+        return parse_to_ist(value).strftime("%Y-%m-%d %H:%M")
+
+    @staticmethod
+    def _csv_cell(value: Any) -> str:
+        """Empty stays empty. A leading formula character is quoted for Excel."""
+        if value is None:
+            return ""
+        text = str(value)
+        if text.startswith(tuple(_CSV_FORMULA_PREFIXES)):
+            return "'" + text
+        return text
 
     @staticmethod
     def _user_matches_search(user: dict[str, Any], needle: str) -> bool:

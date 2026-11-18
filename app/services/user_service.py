@@ -9,6 +9,7 @@ from app.utils.time import now_ist_iso
 from app.exceptions import ConflictError, InfrastructureError, NotFoundError
 from app.models.user_model import ApprovalStatus, TeamMember, UserResponse, UserRole
 from app.services.firebase import FirebaseService
+from app.services.university_service import UniversityService
 
 
 logger = logging.getLogger(__name__)
@@ -149,18 +150,21 @@ class UserService:
         page_size: int,
         role: str | None = None,
         q: str | None = None,
+        university_id: str | None = None,
     ) -> dict[str, Any]:
         """
         One page of non-admin users.
 
-        ``role=student`` reads only student documents. Search matches name,
-        email, niat id, college id, employee id, and mobile number. A mobile
-        query is a substring of the stored number, so ``98259`` matches
+        ``role=student`` reads only student documents. ``university_id`` keeps
+        only documents with that college, then search matches name, email,
+        niat id, college id, employee id, and mobile number. A mobile query is
+        a substring of the stored number, so ``98259`` matches
         ``+919640198259``. Newest ``created_at`` first.
         """
         if role is not None and role not in USER_LIST_ROLES:
             raise ValueError("role must be student or evaluator")
 
+        college_id = self._require_listed_university(university_id)
         page = max(int(page), 1)
         page_size = min(max(int(page_size), 1), MAX_USER_PAGE_SIZE)
         needle = (q or "").strip().lower()
@@ -169,6 +173,9 @@ class UserService:
             users = self.firebase.query_collection("users", "role", "==", role)
         else:
             users = self.get_non_admin_users()
+
+        if college_id:
+            users = [user for user in users if str(user.get("university_id") or "") == college_id]
 
         if needle:
             users = [user for user in users if self._user_matches_search(user, needle)]
@@ -183,6 +190,22 @@ class UserService:
             "page": page,
             "page_size": page_size,
         }
+
+    def _require_listed_university(self, university_id: str | None) -> str | None:
+        """Return a known university id, or None when the filter is omitted.
+
+        Raises ValueError for a blank, path-like, or unknown id. The message
+        avoids "not found" so a ValueError that escapes the route stays 400.
+        """
+        if university_id is None:
+            return None
+        cleaned = university_id.strip()
+        if not cleaned or "/" in cleaned or cleaned in {".", ".."}:
+            raise ValueError("Invalid university id")
+        university = UniversityService(firebase=self.firebase).get_university(cleaned)
+        if not university:
+            raise ValueError("Unknown university")
+        return cleaned
 
     @staticmethod
     def _user_matches_search(user: dict[str, Any], needle: str) -> bool:

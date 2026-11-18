@@ -295,7 +295,7 @@ Register complete endpoints reject reset sessions (`PURPOSE_MISMATCH`).
 
 | Collection | Document | Purpose |
 |------------|----------|---------|
-| `users` | Firebase uid | Profile, `role` (`super_admin`, `admin`, `evaluator`, `student`, `custom`), `custom_role_id`, `approval_status`. Student Management pages with `GET /admin/users?page=1&page_size=15&role=student&q=`. Omitting `page` still returns the full non-admin array. `GET /admin/overview` returns the Overview counts and the newest five pending evaluators. |
+| `users` | Firebase uid | Profile, `role` (`super_admin`, `admin`, `evaluator`, `student`, `custom`), `custom_role_id`, `approval_status`. Student Management pages with `GET /admin/users?page=1&page_size=15&role=student&q=`. An optional `university_id` keeps only that college, and `total` is the filtered count. An unknown or malformed id is 400. Omitting `page` still returns the full non-admin array. `GET /admin/overview` returns the Overview counts and the newest five pending evaluators. |
 | `roles` | role slug (`admin`, `student`, `theme-editor`) | Named roles and their permission keys. The built-in Admin and Student roles are seeded and cannot be edited. A custom role's document id is its name slug. Custom users store `role=custom` and `custom_role_id`. Assigning the Admin role stores `role=admin`. |
 
 `DELETE /admin/access/users/{id}` removes an Admin or custom-role login from Firestore and Firebase Auth. A Super Admin account cannot be deleted.

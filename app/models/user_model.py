@@ -280,7 +280,7 @@ class PaginatedUsersResponse(BaseModel):
     total: int = Field(
         ...,
         ge=0,
-        description="How many users match the role and search, across every page.",
+        description="How many users match the role, college, and search, across every page.",
     )
     page: int = Field(..., ge=1)
     page_size: int = Field(..., ge=1, le=100)

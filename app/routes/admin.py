@@ -75,6 +75,13 @@ async def get_users(
             "inside the stored mobile number."
         ),
     ),
+    university_id: Optional[str] = Query(
+        None,
+        description=(
+            "University document id. When set with page, only users with that "
+            "university_id are returned. Options come from GET /universities."
+        ),
+    ),
     admin: CurrentUser = Depends(get_admin_user),
     user_service: UserService = Depends(get_user_service),
 ) -> PaginatedUsersResponse | list[UserResponse]:
@@ -83,6 +90,7 @@ async def get_users(
 
     Without ``page``, returns every student and evaluator as a JSON array
     (dashboard counts). With ``page``, returns ``{ items, total, page, page_size }``.
+    ``university_id`` limits that page to one college and composes with ``role`` and ``q``.
     """
     _ = admin
     try:
@@ -96,6 +104,7 @@ async def get_users(
             page_size=page_size,
             role=role.strip().lower() if role else None,
             q=q,
+            university_id=university_id,
         )
         return PaginatedUsersResponse(
             items=[user_service.to_user_response(user["id"], user) for user in payload["items"]],
